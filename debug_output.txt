@@ -1,0 +1,13 @@
+API Key: sk_e63e3hbr_9F2KUYJ9...
+Client created
+Error: headers: {'date': 'Wed, 18 Mar 2026 06:50:55 GMT', 'content-type': 'application/json', 'content-length': '265', 'connection': 'keep-alive', 'server': 'uvicorn', 'x-request-id': '20260318_fd738570-91e7-436b-a93a-3acf16dbb96d', 'access-control-allow-origin': '*', 'strict-transport-security': 'max-age=31536000; includeSubDomains; preload'}, status_code: 400, body: {'error': {'message': "Speaker 'aditya' is not compatible with model bulbul:v2. Available speakers for bulbul:v2 are: anushka, abhilash, manisha, vidya, arya, karun, hitesh", 'code': 'invalid_request_error', 'request_id': '20260318_fd738570-91e7-436b-a93a-3acf16dbb96d'}}
+Traceback (most recent call last):
+  File "D:\hotel-relationshipmanager-ai\debug2.py", line 16, in <module>
+    response = client.text_to_speech.convert(
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\user\AppData\Local\Programs\Python\Python311\Lib\site-packages\sarvamai\text_to_speech\client.py", line 179, in convert
+    _response = self._raw_client.convert(
+                ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\user\AppData\Local\Programs\Python\Python311\Lib\site-packages\sarvamai\text_to_speech\raw_client.py", line 201, in convert
+    raise BadRequestError(
+sarvamai.errors.bad_request_error.BadRequestError: headers: {'date': 'Wed, 18 Mar 2026 06:50:55 GMT', 'content-type': 'application/json', 'content-length': '265', 'connection': 'keep-alive', 'server': 'uvicorn', 'x-request-id': '20260318_fd738570-91e7-436b-a93a-3acf16dbb96d', 'access-control-allow-origin': '*', 'strict-transport-security': 'max-age=31536000; includeSubDomains; preload'}, status_code: 400, body: {'error': {'message': "Speaker 'aditya' is not compatible with model bulbul:v2. Available speakers for bulbul:v2 are: anushka, abhilash, manisha, vidya, arya, karun, hitesh", 'code': 'invalid_request_error', 'request_id': '20260318_fd738570-91e7-436b-a93a-3acf16dbb96d'}}
