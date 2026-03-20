@@ -11,7 +11,13 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 import logging
 from datetime import datetime
 from typing import List, Optional, Dict
-from fastapi import FastAPI, HTTPException, Query, Form
+import uuid
+import base64
+import json
+import audioop
+import io
+import wave
+from fastapi import FastAPI, HTTPException, Query, Form, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from fastapi.staticfiles import StaticFiles
@@ -23,8 +29,9 @@ from src.models.database import init_db, get_session, Customer, CallHistory, Cal
 from src.agents.relationship_manager_agent import RelationshipManagerAgent
 from src.services.twilio_service import TwilioService
 from src.services.servam_service import ServamService
-from src.services.conversational_call_handler import ConversationalCallManager, CallStage
+from src.services.conversational_call_handler import ConversationalCallManager
 from src.services.audio_service import AudioService
+from src.services.livekit_streaming_service import LiveKitStreamingService
 from src.utils.call_logger import CallLogger
 from src.utils.dummy_data_generator import initialize_dummy_data
 
@@ -60,7 +67,12 @@ servam_service = ServamService()
 conversational_manager = ConversationalCallManager()
 call_logger = CallLogger()
 audio_service = AudioService()
+livekit_streaming_service = LiveKitStreamingService()
 session = get_session()
+
+# Track processed Twilio recordings to avoid duplicate processing from retries/callback races
+PROCESSED_RECORDING_SIDS = set()
+PROCESSED_STREAM_UTTERANCES = set()
 
 # Setup static files for audio serving
 audio_dir = Path("audio")
@@ -142,6 +154,9 @@ class BulkCreateCustomersResponse(BaseModel):
 class TestCallRequest(BaseModel):
     customer_id: str
     script: Optional[str] = None
+    streaming_mode: bool = False
+    language: str = "unknown"
+    stream_call: bool = False
     
 class TestCallResponse(BaseModel):
     status: str
@@ -151,6 +166,68 @@ class TestCallResponse(BaseModel):
     message: str
     churn_risk: float
     recommended_offer: str
+    websocket_url: Optional[str] = None
+    workflow: Optional[str] = None
+    input_format: Optional[str] = None
+    output_format: Optional[str] = None
+
+
+def _build_twilio_stream_twiml(say_text: str, stream_url: str, customer_id: str, conv_id: str) -> str:
+    safe_text = (say_text or "").replace("&", "and").replace("<", " ").replace(">", " ")
+    safe_stream_url = stream_url.replace("&", "&amp;")
+    return f'''<?xml version="1.0" encoding="UTF-8"?>
+    <Response>
+        <Say>{safe_text}</Say>
+        <Connect>
+            <Stream url="{safe_stream_url}">
+                <Parameter name="customer_id" value="{customer_id}" />
+                <Parameter name="conv_id" value="{conv_id}" />
+            </Stream>
+        </Connect>
+    </Response>'''
+
+
+def _build_twilio_stream_play_twiml(audio_url: str, stream_url: str, customer_id: str, conv_id: str) -> str:
+    safe_audio_url = audio_url.replace("&", "&amp;")
+    safe_stream_url = stream_url.replace("&", "&amp;")
+    return f'''<?xml version="1.0" encoding="UTF-8"?>
+    <Response>
+        <Play>{safe_audio_url}</Play>
+        <Connect>
+            <Stream url="{safe_stream_url}">
+                <Parameter name="customer_id" value="{customer_id}" />
+                <Parameter name="conv_id" value="{conv_id}" />
+            </Stream>
+        </Connect>
+    </Response>'''
+
+
+def _http_to_ws_url(url: str) -> str:
+    return url.replace("https://", "wss://").replace("http://", "ws://")
+
+
+def _pcm16_to_wav_bytes(pcm_bytes: bytes, sample_rate: int = 8000, channels: int = 1) -> bytes:
+    """Wrap raw PCM16 mono audio into a valid WAV container."""
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as wav_file:
+        wav_file.setnchannels(channels)
+        wav_file.setsampwidth(2)  # 16-bit PCM
+        wav_file.setframerate(sample_rate)
+        wav_file.writeframes(pcm_bytes)
+    return buffer.getvalue()
+
+class LiveKitStreamingSessionRequest(BaseModel):
+    customer_id: Optional[str] = None
+    customer_name: Optional[str] = "Guest"
+    language: str = "unknown"
+
+class LiveKitStreamingSessionResponse(BaseModel):
+    status: str
+    session_id: str
+    websocket_url: str
+    workflow: str
+    input_format: str
+    output_format: str
 
 class UpdateCustomerRequest(BaseModel):
     phone: Optional[str] = None
@@ -452,267 +529,283 @@ def init_dummy_data():
 
 # ==================== CONVERSATIONAL CALL HANDLERS ====================
 
-@app.post("/api/v1/calls/handle-response", tags=["Calls"], include_in_schema=False)
-def handle_call_response(
-    customer_id: str = Query(...),
+@app.post("/api/v1/calls/handle-conversational-response", tags=["Calls"], include_in_schema=False)
+def handle_conversational_response(
+    call_sid: str = Query(None),
+    customer_id: str = Query(None),
     SpeechResult: str = Form(None),
     Confidence: str = Form(None),
     CallSid: str = Form(None),
-    From: str = Form(None),
-    To: str = Form(None)
+    RecordingUrl: str = Form(None),
+    RecordingSid: str = Form(None),
+    RecordingDuration: str = Form(None),
+    language: str = Query("en")
 ):
     """
-    Webhook handler for Twilio call responses
-    Processes customer speech input and generates next conversational response
-    This is called automatically by Twilio during a call
+    Dynamic LLM-driven webhook for conversational calls
+    
+    Handles BOTH:
+    - RecordingUrl (from <Record> + recordingStatusCallback) → Send to Sarvam STT
+    - SpeechResult (from legacy <Gather>) → Use directly
+    
+    Flow:
+    1. Get recording audio (if RecordingUrl) → Send to Sarvam STT for transcription
+    2. Get conversation context
+    3. Append user message to history + auto-detect language
+    4. Generate LLM response (using full history)
+    5. Generate TTS audio URL (on-the-fly)
+    6. Append agent response to history
+    7. Return TwiML to Record + play (loop)
+    
+    Called by Twilio when:
+    - Recording completes (recordingStatusCallback)
+    - User hangs up or timeout
     """
     try:
-        # Get customer
-        customer = session.query(Customer).filter_by(customer_id=customer_id).first()
-        if not customer:
-            logger.error(f"Customer {customer_id} not found in webhook handler")
-            # Return fallback TwiML
-            fallback_twiml = '''<?xml version="1.0" encoding="UTF-8"?>
-            <Response>
-                <Say>We apologize, but we encountered an error. Thank you for calling!</Say>
-            </Response>'''
-            return Response(content=fallback_twiml, media_type="application/xml")
+        # ======== STEP 1: Get user's speech transcription ========
         
-        logger.info(f"\n🎙️ WEBHOOK: Customer {customer_id} ({customer.name})")
-        logger.info(f"   Speech Recognized: {SpeechResult} (Confidence: {Confidence})")
-        logger.info(f"   CallSid: {CallSid}")
+        # Handle BOTH scenarios:
+        # 1. New approach: <Record> with recordingStatusCallback sends RecordingUrl
+        # 2. Old approach: <Gather> with speechResult sends SpeechResult
         
-        # Detect sentiment from customer's response
-        language = "en"  # Could be enhanced with auto-detection
-        sentiment = conversational_manager.detect_sentiment(SpeechResult or "okay", language)
-        logger.info(f"   Sentiment: {sentiment}")
+        user_speech = None
         
-        # Generate next conversational response
-        if sentiment == "positive" or (SpeechResult and any(word in SpeechResult.lower() for word in ["yes", "yeah", "hi", "hello", "okay", "ok"])):
-            # Customer responded positively - ask about their experience
-            next_prompt = "Great! How was your recent experience with us? Did you enjoy your stay?"
-            hints = "good, excellent, bad, poor, okay"
-        else:
-            # Default: ask about experience
-            next_prompt = "We'd love to hear about your experience with us. How was your last stay?"
-            hints = "good, excellent, bad, poor, great"
-        
-        # Save this call interaction
-        try:
-            call_history = CallHistory(
-                customer_id=customer_id,
-                call_date=datetime.utcnow(),
-                call_status="in_progress",
-                sentiment=sentiment,
-                conversation_transcript=f"User response: {SpeechResult or '[no response]'}",
-                agent_notes=f"Twilio CallSid: {CallSid}, Confidence: {Confidence}"
-            )
-            session.add(call_history)
-            session.commit()
-            logger.info(f"   ✓ Call interaction saved")
-        except Exception as e:
-            logger.warning(f"   Could not save call history: {str(e)}")
-            session.rollback()
-        
-        # Generate next TwiML response with listening for next input
-        # Use NGROK URL for Twilio callback
-        experience_webhook_url = f"{config.NGROK_BASE_URL}/api/v1/calls/handle-response-experience?customer_id={customer_id}"
-        
-        # Generate Sarvam audio for the experience question (NOT Alice voice!)
-        audio_url = audio_service.generate_audio(next_prompt, "en")
-        
-        if audio_url:
-            # Use Sarvam natural audio instead of Alice voice
-            # IMPORTANT: XML escape the & in the URL
-            audio_play_url = f"{config.NGROK_BASE_URL}{audio_url}".replace("&", "&amp;")
-            next_twiml = f'''<?xml version="1.0" encoding="UTF-8"?>
-        <Response>
-            <Play>{audio_play_url}</Play>
-            <Gather input="speech" speechTimeout="10" hints="{hints}"
-                    action="{experience_webhook_url}" method="POST">
-            </Gather>
-        </Response>'''
-        else:
-            # Fallback to Alice if audio generation fails
-            next_twiml = f'''<?xml version="1.0" encoding="UTF-8"?>
-        <Response>
-            <Say voice="alice">{next_prompt}</Say>
-            <Gather input="speech" speechTimeout="10" hints="{hints}"
-                    action="{experience_webhook_url}" method="POST">
-            </Gather>
-        </Response>'''
-        
-        logger.info(f"   Sending: {next_prompt}")
-        return Response(content=next_twiml, media_type="application/xml")
-        
-    except Exception as e:
-        logger.error(f"Error in handle_call_response: {str(e)}")
-        import traceback
-        logger.error(traceback.format_exc())
-        
-        # Return error TwiML instead of crashing
-        error_twiml = '''<?xml version="1.0" encoding="UTF-8"?>
-        <Response>
-            <Say>We're experiencing a technical difficulty. Thank you for calling Beacon Hotel!</Say>
-        </Response>'''
-        return Response(content=error_twiml, media_type="application/xml")
-
-@app.post("/api/v1/calls/handle-response-experience", tags=["Calls"], include_in_schema=False)
-def handle_experience_response(
-    customer_id: str = Query(...),
-    SpeechResult: str = Form(None),
-    Confidence: str = Form(None),
-    CallSid: str = Form(None)
-):
-    """
-    Handle customer's experience feedback and proceed to visit plans question
-    """
-    try:
-        customer = session.query(Customer).filter_by(customer_id=customer_id).first()
-        if not customer:
-            error_twiml = '''<?xml version="1.0" encoding="UTF-8"?>
-            <Response>
-                <Say>We encountered an error. Thank you for calling!</Say>
-            </Response>'''
-            return Response(content=error_twiml, media_type="application/xml")
-        
-        logger.info(f"\n🎙️ EXPERIENCE FEEDBACK: {customer.name} ({customer_id})")
-        logger.info(f"   Response: {SpeechResult}")
-        
-        # Analyze sentiment of experience feedback
-        sentiment = conversational_manager.detect_sentiment(SpeechResult or "okay", "en")
-        logger.info(f"   Sentiment: {sentiment}")
-        
-        # Update customer sentiment if very positive or negative
-        if sentiment == "positive":
-            customer.loyalty_score = min(100, customer.loyalty_score + 5)
-        elif sentiment == "negative":
-            customer.loyalty_score = max(0, customer.loyalty_score - 10)
-        
-        session.commit()
-        
-        # Ask about future visit plans
-        next_prompt = "That's great to hear! Are you planning to visit us again soon?"
-        hints = "yes, maybe, soon, definitely, not sure, no"
-        
-        # Generate Sarvam audio for the prompt (SAME AS INITIAL GREETING)
-        audio_url = audio_service.generate_audio(next_prompt, "en")
-        
-        # Generate TwiML for visit plans question
-        # Use NGROK URL for Twilio callback
-        visit_plans_webhook_url = f"{config.NGROK_BASE_URL}/api/v1/calls/handle-visit-plans?customer_id={customer_id}"
-        
-        if audio_url:
-            # Use Sarvam natural audio instead of Alice voice
-            # IMPORTANT: XML escape the & in the URL
-            audio_play_url = f"{config.NGROK_BASE_URL}{audio_url}".replace("&", "&amp;")
-            visit_plans_twiml = f'''<?xml version="1.0" encoding="UTF-8"?>
-        <Response>
-            <Play>{audio_play_url}</Play>
-            <Gather input="speech" speechTimeout="10" hints="{hints}"
-                    action="{visit_plans_webhook_url}" method="POST">
-            </Gather>
-        </Response>'''
-        else:
-            # Fallback to Alice if audio fails
-            visit_plans_twiml = f'''<?xml version="1.0" encoding="UTF-8"?>
-        <Response>
-            <Say voice="alice">{next_prompt}</Say>
-            <Gather input="speech" speechTimeout="10" hints="{hints}"
-                    action="{visit_plans_webhook_url}" method="POST">
-            </Gather>
-        </Response>'''
-        
-        logger.info(f"   Next: Asking about visit plans")
-        return Response(content=visit_plans_twiml, media_type="application/xml")
-        
-    except Exception as e:
-        logger.error(f"Error in handle_experience_response: {str(e)}")
-        import traceback
-        logger.error(traceback.format_exc())
-        
-        error_twiml = '''<?xml version="1.0" encoding="UTF-8"?>
-        <Response>
-            <Say>Technical error encountered. Thank you for your time!</Say>
-        </Response>'''
-        return Response(content=error_twiml, media_type="application/xml")
-
-@app.post("/api/v1/calls/handle-visit-plans", tags=["Calls"], include_in_schema=False)
-def handle_visit_plans_response(
-    customer_id: str = Query(...),
-    SpeechResult: str = Form(None),
-    Confidence: str = Form(None),
-    CallSid: str = Form(None)
-):
-    """
-    Handle customer's visit plans response and offer loyalty benefits
-    """
-    try:
-        customer = session.query(Customer).filter_by(customer_id=customer_id).first()
-        if not customer:
-            error_twiml = '''<?xml version="1.0" encoding="UTF-8"?>
-            <Response>
-                <Say>Error encountered. Thank you!</Say>
-            </Response>'''
-            return Response(content=error_twiml, media_type="application/xml")
-        
-        logger.info(f"\n🎙️ VISIT PLANS: {customer.name}")
-        logger.info(f"   Response: {SpeechResult}")
-        
-        # Determine if customer plans to visit
-        speech_lower = (SpeechResult or "").lower()
-        planning_visit = any(word in speech_lower for word in ["yes", "yeah", "definitely", "soon", "will"])
-        
-        if planning_visit:
-            closing_msg = f"Excellent! We look forward to welcoming you back, {customer.name}! Thank you for choosing Beacon Hotel."
-        else:
-            # Get analysis to determine discount
-            try:
-                analysis = relationship_agent.analyze_customer_history(customer_id)
-                recommended_discount = analysis.get("recommended_discount", "10% OFF") if analysis else "10% OFF"
-                # Extract percentage if it's a string like "5% OFF"
-                if isinstance(recommended_discount, str) and "OFF" in recommended_discount:
-                    discount_pct = recommended_discount.split("%")[0]
-                else:
-                    discount_pct = 10
-            except:
-                discount_pct = 10
-                recommended_discount = "10% OFF"
+        if RecordingUrl:
+            logger.info(f"\n🎙️ RECORDING RECEIVED: {RecordingUrl} (duration: {RecordingDuration}s)")
+            logger.info(f"   Sending to Sarvam STT (language: {language})...")
             
-            closing_msg = f"That's okay! Here's a special {discount_pct}% loyalty discount for your next visit. Thank you, {customer.name}!"
-            customer.loyalty_score = min(100, customer.loyalty_score + 10)
-            session.commit()
+            try:
+                # Extract Recording SID from URL
+                # Format: https://api.twilio.com/.../Recordings/RE{SID}
+                recording_sid = RecordingSid or RecordingUrl.split("/")[-1]
+                if "." in recording_sid:
+                    recording_sid = recording_sid.split(".")[0]
+                logger.debug(f"   Extracted Recording SID: {recording_sid}")
+
+                # Dedupe duplicate callbacks for same recording
+                if recording_sid in PROCESSED_RECORDING_SIDS:
+                    logger.info(f"   ↩️ Duplicate recording callback ignored: {recording_sid}")
+                    noop_twiml = '''<?xml version="1.0" encoding="UTF-8"?>
+                    <Response></Response>'''
+                    return Response(content=noop_twiml, media_type="application/xml")
+                PROCESSED_RECORDING_SIDS.add(recording_sid)
+                
+                # Construct the proper WAV download URL
+                # Twilio requires the full URI for authenticated download
+                wav_url = f"https://api.twilio.com/2010-04-01/Accounts/{config.TWILIO_ACCOUNT_SID}/Recordings/{recording_sid}.wav"
+                logger.debug(f"   WAV URL: {wav_url}")
+                
+                # Use requests with Twilio basic auth
+                import requests
+                from requests.auth import HTTPBasicAuth
+                
+                auth = HTTPBasicAuth(config.TWILIO_ACCOUNT_SID, config.TWILIO_AUTH_TOKEN)
+                response = requests.get(wav_url, auth=auth, timeout=10)
+                
+                if response.status_code == 200:
+                    audio_bytes = response.content
+                    logger.debug(f"   ✅ Downloaded {len(audio_bytes)} bytes from Twilio")
+                    
+                    # Send to Sarvam STT
+                    stt_language = "unknown"
+                    if language and language.lower() not in ["en", "unknown"]:
+                        stt_language = conversational_manager.sarvam.get_language_code(language)
+                    # Sarvam STT accepts en-IN, not en-US
+                    if stt_language == "en-US":
+                        stt_language = "en-IN"
+
+                    stt_result = conversational_manager.sarvam.speech_to_text(
+                        audio_data=audio_bytes,
+                        language=stt_language
+                    )
+                    
+                    if stt_result and stt_result.get('text'):
+                        user_speech = stt_result['text']
+                        detected_lang = stt_result.get('language', language)
+                        logger.info(f"   ✓ Sarvam STT: '{user_speech}' (detected_lang={detected_lang})")
+                    else:
+                        logger.warning("   Sarvam STT returned empty transcription")
+                        user_speech = "[silence]"
+                else:
+                    logger.error(f"   ❌ Failed to download recording: HTTP {response.status_code}")
+                    logger.error(f"   Response: {response.text[:200]}")
+                    user_speech = "[silence]"
+                    
+            except Exception as stt_err:
+                logger.error(f"   Error processing recording: {type(stt_err).__name__}: {str(stt_err)}")
+                import traceback
+                logger.error(traceback.format_exc())
+                user_speech = "[silence]"
         
-        # Generate Sarvam audio for closing message (NOT Alice voice!)
-        audio_url = audio_service.generate_audio(closing_msg, "en")
+        elif SpeechResult:
+            # Fallback to Twilio's transcription if available
+            user_speech = SpeechResult
+            logger.info(f"\n🎙️ TWILIO TRANSCRIPTION: '{user_speech}' (confidence: {Confidence})")
         
-        # Final closing TwiML - just play the Sarvam audio with no extra voice
-        if audio_url:
-            # IMPORTANT: XML escape the & in the URL
-            audio_play_url = f"{config.NGROK_BASE_URL}{audio_url}".replace("&", "&amp;")
-            closing_twiml = f'''<?xml version="1.0" encoding="UTF-8"?>
-        <Response>
-            <Play>{audio_play_url}</Play>
-            <Hangup/>
-        </Response>'''
         else:
-            # Fallback to Alice if audio fails
-            closing_twiml = f'''<?xml version="1.0" encoding="UTF-8"?>
-        <Response>
-            <Say voice="alice">{closing_msg}</Say>
-        </Response>'''
+            logger.warning("No speech or recording received")
+            user_speech = "[silence]"
+
         
-        logger.info(f"   Closing: {closing_msg}")
-        return Response(content=closing_twiml, media_type="application/xml")
+        # ======== STEP 2: Get conversation context ========
+        logger.info(f"   call_sid={call_sid}, customer_id={customer_id}, CallSid={CallSid}")
         
+        context = conversational_manager.get_conversation_context(call_sid)
+        if not context and CallSid:
+            context = conversational_manager.get_conversation_context(CallSid)
+            if context:
+                logger.info(f"   Found context using Twilio CallSid: {CallSid}")
+                call_sid = CallSid
+        
+        if not context:
+            logger.error(f"Conversation context not found: call_sid={call_sid}, CallSid={CallSid}")
+            error_twiml = '''<?xml version="1.0" encoding="UTF-8"?>
+            <Response>
+                <Say>Your session has expired. Thank you for calling.</Say>
+                <Hangup/>
+            </Response>'''
+            return Response(content=error_twiml, media_type="application/xml")
+        
+        # ======== STEP 3: Append user message to history ========
+        if not conversational_manager.append_user_message(call_sid, user_speech or "[silence]"):
+            logger.error("Failed to append user message")
+            error_twiml = '''<?xml version="1.0" encoding="UTF-8"?>
+            <Response>
+                <Say>Error processing your response. Please try again.</Say>
+            </Response>'''
+            return Response(content=error_twiml, media_type="application/xml")
+        
+        # ⚠️ END CALL TRIGGERS: Detect if user wants to end call
+        end_keywords = ["bye", "goodbye", "thank you", "not interested", "busy", "call later", "later", "thanks"]
+        is_end_trigger = any(word in (user_speech or "").lower() for word in end_keywords)
+        
+        logger.info(f"   Language: {context['language']} | End trigger: {is_end_trigger}")
+        
+        # Keep conversations concise (greeting, plan question, offer, close)
+        if context["turn_count"] >= 4:
+            logger.info("Max conversation turns reached. Ending call.")
+            summary = conversational_manager.end_conversation(call_sid)
+            if summary:
+                logger.info(f"Call summary saved: {summary}")
+            
+            lang = context.get("language", "en")
+            closing_messages = {
+                "en": "Thank you so much! As a special token of appreciation, we offer you a 20% discount on your next stay. We really hope to see you again soon. Goodbye!",
+                "hi": "बहुत धन्यवाद! आभार स्वरूप आपकी अगली यात्रा पर 20% की विशेष छूट है। हम आपको फिर से जल्द देखना चाहेंगे। अलविदा!",
+            }
+            closing_msg = closing_messages.get(lang, closing_messages["en"])
+            
+            # Generate TTS for closing message (NEVER use <Say> - that's Alice voice!)
+            audio_url = conversational_manager.text_to_speech_url(closing_msg, lang)
+            if audio_url:
+                full_audio_url = f"{config.NGROK_BASE_URL}{audio_url}" if not audio_url.startswith("http") else audio_url
+                audio_url_xml = full_audio_url.replace("&", "&amp;")
+                close_twiml = f'''<?xml version="1.0" encoding="UTF-8"?>
+            <Response>
+                <Play>{audio_url_xml}</Play>
+                <Hangup/>
+            </Response>'''
+            else:
+                # Fallback: silently hang up if TTS fails
+                close_twiml = '''<?xml version="1.0" encoding="UTF-8"?>
+            <Response>
+                <Hangup/>
+            </Response>'''
+            
+            return Response(content=close_twiml, media_type="application/xml")
+        
+        # Step 2: Generate LLM response (uses full conversation history)
+        logger.debug("Generating LLM response with full conversation history...")
+        agent_response = conversational_manager.generate_next_response(call_sid)
+        
+        # Log response status for debugging
+        if agent_response:
+            logger.info(f"✓ LLM Response (len={len(agent_response)}): {agent_response[:80]}...")
+        else:
+            logger.warning(f"⚠️ LLM returned None | lang={context.get('language')} turn={context.get('turn_count')}")
+        
+        if not agent_response:
+            logger.warning("LLM generation failed, using contextual fallback")
+            lang = context.get("language", "en")
+            turn = context.get("turn_count", 0)
+            
+            # Contextual fallback: Don't force questions, acknowledge and move forward
+            fallback_responses = {
+                "en": [
+                    "Thank you for sharing that. I appreciate your feedback.",
+                    "That's helpful to know. Is there anything else about your stay?",
+                    "I understand. When might you be able to visit us again?",
+                    "Thank you for your time today. We have a special offer for you.",
+                ],
+                "hi": [
+                    "धन्यवाद! आपकी बात सुनकर खुशी हुई।",
+                    "समझ गया। और कुछ बताना चाहेंगे?",
+                    "ठीक है। आप दोबारा कब आ सकते हैं?",
+                    "आपके समय के लिए धन्यवाद! हमारे पास एक विशेष ऑफर है।",
+                ]
+            }
+            
+            responses = fallback_responses.get(lang, fallback_responses["en"])
+            agent_response = responses[turn % len(responses)]
+            logger.info(f"⚠️ Using contextual fallback (turn {turn}, lang={lang}): {agent_response[:60]}")
+        
+        # Step 3: Append agent response to history
+        if not conversational_manager.append_agent_message(call_sid, agent_response):
+            logger.error("Failed to append agent message")
+            agent_response = "Thank you for your response."
+        
+        # ✅ VALIDATION: Ensure agent_response is never empty (safeguard)
+        if not agent_response or not isinstance(agent_response, str) or len(agent_response.strip()) == 0:
+            logger.error(f"❌ CRITICAL: agent_response is empty or invalid! Type: {type(agent_response)}, Value: '{agent_response}'")
+            agent_response = "I'm sorry, could you please repeat that?"
+            logger.info(f"Using emergency fallback: {agent_response}")
+        
+        # Step 4: Generate TTS audio endpoint URL (on-the-fly, no file storage)
+        logger.debug(f"Generating TTS audio URL for: {agent_response[:50]}...")
+        audio_url = conversational_manager.text_to_speech_url(agent_response, context["language"])
+        
+        # Step 5: Generate TwiML to play audio + listen (loop)
+        if not audio_url:
+            logger.warning("TTS generation failed, cannot continue without audio")
+            error_twiml = '''<?xml version="1.0" encoding="UTF-8"?>
+            <Response>
+                <Say>Audio generation failed. Ending call.</Say>
+                <Hangup/>
+            </Response>'''
+            return Response(content=error_twiml, media_type="application/xml")
+        
+        full_audio_url = f"{config.NGROK_BASE_URL}{audio_url}" if not audio_url.startswith("http") else audio_url
+        audio_url_xml = full_audio_url.replace("&", "&amp;")
+        
+        # 🛑 IF END TRIGGER WAS DETECTED → Hangup instead of Gather
+        if is_end_trigger:
+            logger.info(f"🛑 END TRIGGER DETECTED - Hanging up after discount response")
+            close_twiml = f'''<?xml version="1.0" encoding="UTF-8"?>
+            <Response>
+                <Play>{audio_url_xml}</Play>
+                <Hangup/>
+            </Response>'''
+            return Response(content=close_twiml, media_type="application/xml")
+        
+        # 🔄 NORMAL FLOW - Continue gathering user input
+        next_webhook = f"{config.NGROK_BASE_URL}/api/v1/calls/handle-conversational-response?call_sid={call_sid}&customer_id={customer_id}"
+        lang = context.get("language", "en")
+        twiml = conversational_manager.get_next_twiml(full_audio_url, next_webhook, lang)
+        
+        logger.info(f"   Agent: {agent_response[:50]}...")
+        logger.info(f"   Turn: {context['turn_count']}/4")
+        
+        return Response(content=twiml, media_type="application/xml")
+    
     except Exception as e:
-        logger.error(f"Error in handle_visit_plans_response: {str(e)}")
+        logger.error(f"Error in handle_conversational_response: {str(e)}")
         import traceback
         logger.error(traceback.format_exc())
         
         error_twiml = '''<?xml version="1.0" encoding="UTF-8"?>
         <Response>
-            <Say>Thank you for calling Beacon Hotel. Goodbye!</Say>
+            <Say>We encountered a technical difficulty. Thank you for calling Beacon Hotel.</Say>
+            <Hangup/>
         </Response>'''
         return Response(content=error_twiml, media_type="application/xml")
 
@@ -961,20 +1054,274 @@ def generate_audio_stream(
         logger.error(traceback.format_exc())
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.post("/api/v1/stream/livekit/session", response_model=LiveKitStreamingSessionResponse, tags=["Streaming"])
+def create_livekit_streaming_session(req: LiveKitStreamingSessionRequest):
+    """
+    Create a LiveKit streaming bridge session.
+
+    Use returned websocket URL to stream audio chunks from LiveKit.
+    """
+    try:
+        session_id = f"lk_{uuid.uuid4().hex[:12]}"
+
+        base_url = (config.NGROK_BASE_URL or "http://localhost:8000").strip().rstrip("/")
+        ws_base = base_url.replace("https://", "wss://").replace("http://", "ws://")
+        websocket_url = (
+            f"{ws_base}/api/v1/stream/livekit/ws/{session_id}"
+            f"?language={req.language}&customer_name={req.customer_name or 'Guest'}"
+        )
+
+        return LiveKitStreamingSessionResponse(
+            status="ready",
+            session_id=session_id,
+            websocket_url=websocket_url,
+            workflow="LiveKit streaming -> Sarvam streaming STT -> LLM -> Sarvam streaming TTS",
+            input_format='{"type":"audio_chunk","audio":"<base64_pcm_s16le>","sample_rate":16000,"encoding":"audio/pcm"}',
+            output_format='{"type":"tts_audio_chunk","audio":"<base64_audio>","content_type":"audio/mpeg"}',
+        )
+    except Exception as e:
+        logger.error(f"Error creating LiveKit streaming session: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.websocket("/api/v1/stream/livekit/ws/{session_id}")
+async def livekit_streaming_bridge_ws(
+    websocket: WebSocket,
+    session_id: str,
+    language: str = Query("unknown"),
+    customer_name: str = Query("Guest"),
+):
+    """
+    WebSocket bridge endpoint for LiveKit streaming pipeline.
+
+    Client sends `audio_chunk` messages with base64 PCM audio.
+    Server streams back STT/LLM/TTS events and audio chunks.
+    """
+    await websocket.accept()
+    logger.info(f"🎧 LiveKit streaming session connected: {session_id}, lang={language}, customer={customer_name}")
+    try:
+        await livekit_streaming_service.run_bridge_session(
+            websocket=websocket,
+            customer_name=customer_name,
+            language=language,
+        )
+    except WebSocketDisconnect:
+        logger.info(f"LiveKit streaming session disconnected: {session_id}")
+    except Exception as e:
+        logger.error(f"LiveKit streaming websocket error ({session_id}): {str(e)}")
+        try:
+            await websocket.close(code=1011)
+        except Exception:
+            pass
+
+
+@app.websocket("/api/v1/stream/twilio/ws")
+async def twilio_media_stream_ws(
+    websocket: WebSocket,
+    customer_id: Optional[str] = Query(None),
+    conv_id: Optional[str] = Query(None),
+):
+    """
+    Twilio Media Streams websocket endpoint.
+
+    Receives real-time call audio (no recording), runs STT -> LLM,
+    then updates the call with a spoken response and reconnects stream.
+    """
+    await websocket.accept()
+    logger.info(f"🎧 Twilio media stream connected: conv_id={conv_id}, customer_id={customer_id}")
+
+    stream_sid = None
+    call_sid = None
+    audio_buffer = bytearray()
+    response_sent = False
+    empty_stt_events = 0
+
+    try:
+        while True:
+            raw_text = await websocket.receive_text()
+            payload = json.loads(raw_text)
+            event_type = payload.get("event")
+
+            if event_type == "start":
+                start = payload.get("start", {})
+                stream_sid = start.get("streamSid")
+                call_sid = start.get("callSid")
+
+                # Twilio custom params from <Stream><Parameter .../></Stream>
+                custom_params = start.get("customParameters") or start.get("custom_parameters") or {}
+                if not customer_id:
+                    customer_id = custom_params.get("customer_id")
+                if not conv_id:
+                    conv_id = custom_params.get("conv_id")
+
+                logger.info(f"Twilio stream start: stream_sid={stream_sid}, call_sid={call_sid}")
+                logger.info(f"Twilio stream params: customer_id={customer_id}, conv_id={conv_id}")
+
+                if not customer_id or not conv_id:
+                    logger.error("Twilio stream missing customer_id/conv_id; closing websocket")
+                    await websocket.close(code=1008)
+                    break
+                continue
+
+            if event_type == "media":
+                if response_sent:
+                    continue
+
+                media = payload.get("media", {})
+                b64_audio = media.get("payload")
+                if not b64_audio:
+                    continue
+
+                try:
+                    ulaw_bytes = base64.b64decode(b64_audio)
+                    pcm16 = audioop.ulaw2lin(ulaw_bytes, 2)  # 8k ulaw -> 16-bit PCM
+                    audio_buffer.extend(pcm16)
+                except Exception:
+                    continue
+
+                # Process once we have enough audio for short utterances.
+                # Slightly larger window avoids early silence-only STT calls.
+                if len(audio_buffer) < 24000:
+                    continue
+
+                if not call_sid:
+                    audio_buffer.clear()
+                    continue
+
+                utterance_key = f"{call_sid}:{len(audio_buffer)}"
+                if utterance_key in PROCESSED_STREAM_UTTERANCES:
+                    audio_buffer.clear()
+                    continue
+                PROCESSED_STREAM_UTTERANCES.add(utterance_key)
+
+                stt_result = conversational_manager.sarvam.speech_to_text(
+                    audio_data=_pcm16_to_wav_bytes(bytes(audio_buffer), sample_rate=8000),
+                    language="unknown",
+                )
+                audio_buffer.clear()
+
+                user_text = (stt_result or {}).get("text", "").strip()
+                if not user_text:
+                    empty_stt_events += 1
+                    logger.info(f"Twilio stream STT returned empty transcript (count={empty_stt_events})")
+
+                    # If STT repeatedly returns empty, reprompt user to continue the call.
+                    if empty_stt_events >= 2 and call_sid and conv_id and customer_id:
+                        context = conversational_manager.get_conversation_context(conv_id)
+                        current_lang = context.get("language", "en") if context else "en"
+                        customer_name = context.get("customer_name", "Guest") if context else "Guest"
+
+                        reprompts = {
+                            "en": f"I couldn't catch that {customer_name}. Are you planning to visit us again soon?",
+                            "hi": f"माफ़ कीजिए {customer_name}, आपकी बात साफ़ नहीं सुन पाया। क्या आप जल्द ही फिर से आने की योजना बना रहे हैं?",
+                        }
+                        reprompt_text = reprompts.get(current_lang, reprompts["en"])
+
+                        stream_http_url = f"{config.NGROK_BASE_URL}/api/v1/stream/twilio/ws"
+                        stream_url = _http_to_ws_url(stream_http_url)
+                        response_audio_url = conversational_manager.text_to_speech_url(reprompt_text, current_lang)
+
+                        if response_audio_url:
+                            full_audio_url = f"{config.NGROK_BASE_URL}{response_audio_url}" if not response_audio_url.startswith("http") else response_audio_url
+                            twiml = _build_twilio_stream_play_twiml(full_audio_url, stream_url, customer_id, conv_id)
+                        else:
+                            twiml = _build_twilio_stream_twiml(reprompt_text, stream_url, customer_id, conv_id)
+
+                        try:
+                            twilio_service.client.calls(call_sid).update(twiml=twiml)
+                            logger.info(f"✅ Twilio call reprompted after empty STT: call_sid={call_sid}")
+                            response_sent = True
+                        except Exception as update_err:
+                            logger.error(f"Failed to reprompt Twilio call after empty STT: {str(update_err)}")
+
+                    continue
+
+                empty_stt_events = 0
+
+                logger.info(f"🎙️ Twilio stream STT: {user_text}")
+
+                if not conversational_manager.get_conversation_context(conv_id):
+                    conversational_manager.init_conversation(conv_id, customer_id, "en")
+
+                conversational_manager.append_user_message(conv_id, user_text)
+
+                context = conversational_manager.get_conversation_context(conv_id)
+                current_lang = context.get("language", "en") if context else "en"
+                current_turn = context.get("turn_count", 0) if context else 0
+                customer_name = context.get("customer_name", "Guest") if context else "Guest"
+
+                agent_text = conversational_manager.generate_next_response(conv_id)
+                if not agent_text:
+                    user_text_l = user_text.lower()
+
+                    # Deterministic first follow-up: after "I'm fine" style response, ask visit plan next
+                    fine_markers = ["i'm fine", "im fine", "i am fine", "fine", "ठीक", "फाइन", "आई एम फाइन"]
+                    if current_turn == 0 and any(marker in user_text_l for marker in fine_markers):
+                        agent_text = conversational_manager.get_visit_plans_question(customer_name, current_lang)
+                    elif current_turn <= 1:
+                        agent_text = conversational_manager.get_visit_plans_question(customer_name, current_lang)
+                    elif current_turn == 2:
+                        agent_text = conversational_manager.get_loyalty_offer(customer_name, 20, current_lang)
+                    else:
+                        closing_fallbacks = {
+                            "en": "Thank you for your time. We have a special offer ready for your next visit.",
+                            "hi": "आपके समय के लिए धन्यवाद। आपकी अगली यात्रा के लिए हमारा विशेष ऑफर तैयार है।",
+                        }
+                        agent_text = closing_fallbacks.get(current_lang, closing_fallbacks["en"])
+
+                conversational_manager.append_agent_message(conv_id, agent_text)
+
+                # Reconnect stream after speaking response (Sarvam TTS playback, not Twilio Alice voice)
+                stream_http_url = f"{config.NGROK_BASE_URL}/api/v1/stream/twilio/ws"
+                stream_url = _http_to_ws_url(stream_http_url)
+
+                context = conversational_manager.get_conversation_context(conv_id)
+                response_lang = context.get("language", "en") if context else "en"
+                response_audio_url = conversational_manager.text_to_speech_url(agent_text, response_lang)
+
+                if response_audio_url:
+                    full_audio_url = f"{config.NGROK_BASE_URL}{response_audio_url}" if not response_audio_url.startswith("http") else response_audio_url
+                    twiml = _build_twilio_stream_play_twiml(full_audio_url, stream_url, customer_id, conv_id)
+                else:
+                    twiml = _build_twilio_stream_twiml(agent_text, stream_url, customer_id, conv_id)
+
+                try:
+                    twilio_service.client.calls(call_sid).update(twiml=twiml)
+                    logger.info(f"✅ Twilio call updated with stream response: call_sid={call_sid}")
+                    response_sent = True
+                except Exception as update_err:
+                    logger.error(f"Failed updating Twilio call with response: {str(update_err)}")
+                    response_sent = True
+
+            if event_type == "stop":
+                logger.info(f"Twilio stream stop: stream_sid={stream_sid}, call_sid={call_sid}")
+                break
+
+    except WebSocketDisconnect:
+        logger.info("Twilio media websocket disconnected")
+    except Exception as e:
+        logger.error(f"Twilio media stream error: {str(e)}")
+        try:
+            await websocket.close(code=1011)
+        except Exception:
+            pass
+
 @app.post("/api/v1/calls/test", response_model=TestCallResponse, tags=["TestData"])
 def test_call_to_customer(test_call_req: TestCallRequest):
     """
-    Make a CONVERSATIONAL call to a customer.
+    Make a test conversational call.
+
+    Modes:
+    - Twilio call mode (default): Existing phone-call flow
+    - Streaming mode: Returns LiveKit streaming websocket bridge details
     
-    This initiates an intelligent, multi-turn conversation that:
-    1. Greets the customer warmly
-    2. Listens to their response
-    3. Detects their language automatically
-    4. Continues conversation in their language
-    5. Asks about their experience
-    6. Offers loyalty benefits if they're not planning to visit
-    
-    Much more natural and relationship-building than robotic scripts!
+    Flow:
+    1. Initialize conversation with system prompt
+    2. Generate personalized greeting with TTS
+    3. Twilio makes call and plays greeting
+    4. Twilio Gather captures speech → handle-conversational-response webhook
+    5. Webhook processes with LLM (full history) → generates response
+    6. TTS + Play + Gather loop continues for up to 5 turns
+    7. Call ends after 5 turns or customer says goodbye
     
     Example:
     {
@@ -987,75 +1334,141 @@ def test_call_to_customer(test_call_req: TestCallRequest):
         if not customer:
             raise HTTPException(status_code=404, detail=f"Customer {test_call_req.customer_id} not found")
         
-        logger.info(f"Initiating CONVERSATIONAL call to {customer.customer_id} ({customer.phone})")
+        logger.info(f"🎙️ Initiating test call for {customer.customer_id} ({customer.phone})")
+
+        # Streaming mode with live call: place Twilio call and stream audio directly (no recording)
+        if test_call_req.streaming_mode and test_call_req.stream_call:
+            call_sid = f"CONV_{uuid.uuid4().hex[:12]}"
+
+            context = conversational_manager.init_conversation(call_sid, test_call_req.customer_id, "en")
+            if not context:
+                raise HTTPException(status_code=500, detail="Failed to initialize conversation")
+
+            greeting = conversational_manager.get_greeting(customer.name, "en")
+            stream_http_url = f"{config.NGROK_BASE_URL}/api/v1/stream/twilio/ws"
+            stream_url = _http_to_ws_url(stream_http_url)
+
+            greeting_audio_url = conversational_manager.text_to_speech_url(greeting, "en")
+            if greeting_audio_url:
+                full_audio_url = f"{config.NGROK_BASE_URL}{greeting_audio_url}" if not greeting_audio_url.startswith("http") else greeting_audio_url
+                twiml = _build_twilio_stream_play_twiml(full_audio_url, stream_url, test_call_req.customer_id, call_sid)
+            else:
+                twiml = _build_twilio_stream_twiml(greeting, stream_url, test_call_req.customer_id, call_sid)
+
+            twilio_sid = None
+            try:
+                call = twilio_service.client.calls.create(
+                    to=customer.phone,
+                    from_=twilio_service.phone_number,
+                    twiml=twiml,
+                )
+                twilio_sid = call.sid
+                logger.info(f"✅ Stream call placed: conv_id={call_sid}, twilio_sid={twilio_sid}")
+            except Exception as call_err:
+                logger.error(f"Stream call placement failed: {str(call_err)}")
+                raise HTTPException(status_code=500, detail=f"Failed to place stream call: {str(call_err)}")
+
+            return TestCallResponse(
+                status="stream_call_initiated",
+                call_sid=call_sid,
+                customer_name=customer.name,
+                phone=customer.phone,
+                message=(
+                    "📞 STREAMING CALL STARTED (NO RECORDING)\n"
+                    "✓ Twilio live media stream connected\n"
+                    "✓ Sarvam STT + LLM response loop\n"
+                    "✓ Twilio speaks generated response and reconnects stream"
+                ),
+                churn_risk=0.5,
+                recommended_offer="Dynamic based on LLM conversation",
+                websocket_url=f"{stream_url}?customer_id={test_call_req.customer_id}&conv_id={call_sid}",
+                workflow="Twilio live stream -> Sarvam STT -> LLM -> Twilio spoken response",
+                input_format='Twilio Media Streams JSON events (start/media/stop)',
+                output_format='Twilio call update with TwiML <Play(Sarvam TTS)> + <Connect><Stream>',
+            )
+
+        # Streaming test mode: return websocket session details for LiveKit bridge
+        if test_call_req.streaming_mode:
+            session_id = f"lk_{uuid.uuid4().hex[:12]}"
+            base_url = (config.NGROK_BASE_URL or "http://localhost:8000").strip().rstrip("/")
+            ws_base = base_url.replace("https://", "wss://").replace("http://", "ws://")
+            websocket_url = (
+                f"{ws_base}/api/v1/stream/livekit/ws/{session_id}"
+                f"?language={test_call_req.language}&customer_name={customer.name}"
+            )
+
+            logger.info(f"✓ Streaming test session ready: {session_id}")
+            return TestCallResponse(
+                status="streaming_ready",
+                call_sid=session_id,
+                customer_name=customer.name,
+                phone=customer.phone,
+                message=(
+                    "🎧 LIVEKIT STREAMING TEST READY\n"
+                    "✓ Sarvam streaming STT\n"
+                    "✓ LLM response generation\n"
+                    "✓ Sarvam streaming TTS\n"
+                    "Send audio_chunk messages to websocket_url"
+                ),
+                churn_risk=0.5,
+                recommended_offer="Dynamic based on LLM conversation",
+                websocket_url=websocket_url,
+                workflow="LiveKit streaming -> Sarvam streaming STT -> LLM -> Sarvam streaming TTS",
+                input_format='{"type":"audio_chunk","audio":"<base64_pcm_s16le>","sample_rate":16000,"encoding":"audio/pcm"}',
+                output_format='{"type":"tts_audio_chunk","audio":"<base64_audio>","content_type":"audio/mpeg"}',
+            )
         
-        # Generate dynamic audio URL (ON-THE-FLY, no file storage)
-        logger.info("Generating dynamic Sarvam TTS endpoint for natural conversation...")
-        initial_language = "en"
-        greeting = conversational_manager.get_greeting_script(customer.name, initial_language)
-        logger.info(f"📝 Greeting text: '{greeting}' [Length: {len(greeting)} chars]")
+        # Twilio call mode: Generate call SID for conversation tracking
+        call_sid = f"CONV_{uuid.uuid4().hex[:12]}"
         
-        # Get the dynamic audio generation URL (no file storage!)
-        greeting_audio_url = audio_service.generate_audio(greeting, initial_language)
-        logger.info(f"🔗 Audio endpoint URL: {greeting_audio_url}")
+        # Step 1: Initialize conversation with LLM system prompt
+        logger.info("Initializing conversation context with system prompt...")
+        language = "en"
+        context = conversational_manager.init_conversation(call_sid, test_call_req.customer_id, language)
+        if not context:
+            raise HTTPException(status_code=500, detail="Failed to initialize conversation")
         
-        # Create TwiML with PLAY instead of SAY for natural voice
-        webhook_url = f"{config.NGROK_BASE_URL}/api/v1/calls/handle-response?customer_id={test_call_req.customer_id}"
+        # Step 2: Generate greeting
+        logger.info("Generating personalized greeting...")
+        greeting = conversational_manager.get_greeting(customer.name, language)
+        logger.info(f"📝 Greeting: {greeting}")
         
-        if greeting_audio_url:
-            # Use dynamic Sarvam natural audio (bulbul:v3 Indian voice)
-            # Audio is generated ON-THE-FLY when Twilio requests it - no file storage!
-            audio_play_url = f"{config.NGROK_BASE_URL}{greeting_audio_url}"
-            # CRITICAL: Escape & as &amp; for valid XML in TwiML
-            audio_play_url_xml = audio_play_url.replace("&", "&amp;")
-            webhook_url_xml = webhook_url.replace("&", "&amp;")
-            
-            simple_twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
-        <Response>
-            <Play>{audio_play_url_xml}</Play>
-            <Gather input="speech" speechTimeout="10" hints="yes, hi, hello, okay" 
-                    action="{webhook_url_xml}" method="POST">
-            </Gather>
-        </Response>"""
-            logger.info(f"✓ Using dynamic Sarvam audio (on-the-fly): {greeting_audio_url}")
-            logger.debug(f"📋 TwiML being sent:\n{simple_twiml}")
-        else:
-            # Fallback to text if audio generation fails
-            webhook_url_xml = webhook_url.replace("&", "&amp;")
-            simple_twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
-        <Response>
-            <Say voice="alice">{greeting}</Say>
-            <Gather input="speech" speechTimeout="10" hints="yes, hi, hello, okay" 
-                    action="{webhook_url_xml}" method="POST">
-            </Gather>
-        </Response>"""
-            logger.info("Using fallback text-to-speech")
+        # Step 3: Generate TTS audio URL (on-the-fly, no file storage)
+        audio_url = conversational_manager.text_to_speech_url(greeting, language)
+        if not audio_url:
+            logger.warning("TTS generation failed, cannot make call without audio")
+            raise HTTPException(status_code=500, detail="TTS service unavailable")
         
-        # Make the call with conversational TwiML (pass directly to Twilio)
-        logger.info(f"Sending conversational TwiML to Twilio")
+        # Generate initial TwiML with greeting
+        full_audio_url = f"{config.NGROK_BASE_URL}{audio_url}" if not audio_url.startswith("http") else audio_url
+        webhook_url = f"{config.NGROK_BASE_URL}/api/v1/calls/handle-conversational-response?call_sid={call_sid}&customer_id={test_call_req.customer_id}"
+        initial_twiml = conversational_manager.get_next_twiml(full_audio_url, webhook_url, language)
         
+        # Step 4: Make the call with initial TwiML
+        logger.info(f"Making call via Twilio...")
         try:
-            # Call Twilio directly with TwiML
             call = twilio_service.client.calls.create(
                 to=customer.phone,
                 from_=twilio_service.phone_number,
-                twiml=simple_twiml
+                twiml=initial_twiml
             )
-            call_sid = call.sid
-            logger.info(f"✓ Conversational call created with SID: {call_sid}")
+            actual_call_sid = call.sid
+            # NOTE: We DO NOT migrate to Twilio's SID because the TwiML URL already contains our call_sid (CONV_xxx)
+            # Twilio will call back with our call_sid embedded in the URL, so we keep conversation history under CONV_xxx
+            logger.info(f"✓ Call created: Generated SID={call_sid}, Twilio SID={actual_call_sid}")
         except Exception as e:
             logger.error(f"Twilio call failed: {str(e)}")
-            call_sid = f"CONV_{test_call_req.customer_id}_{datetime.utcnow().timestamp()}"
-            logger.warning(f"Using mock call SID: {call_sid}")
+            # Use mock SID for testing
+            logger.warning("Using mock call SID for demo")
         
         return TestCallResponse(
             status="call_initiated",
             call_sid=call_sid,
             customer_name=customer.name,
             phone=customer.phone,
-            message=f"🎙️ Conversational call initiated with NATURAL SARVAM VOICE 🎤\n1. ✓ Greeting with Indian accent\n2. ✓ Listens to response\n3. ✓ Continues conversation naturally\n4. ✓ Asks about experience\n5. ✓ Offers personalized loyalty deals",
+            message=f"🎙️ LLM-DRIVEN CONVERSATIONAL CALL STARTED 🎤\n✓ Dynamic greeting with TTS\n✓ Full conversation history tracking\n✓ LLM generates responses (not scripted)\n✓ Natural multi-turn dialogue\n✓ Sentiment & loyalty analysis\n✓ Max 5 turns per call",
             churn_risk=0.5,
-            recommended_offer="Personalized based on conversation"
+            recommended_offer="Dynamic based on LLM conversation"
         )
     except HTTPException:
         raise

@@ -4,6 +4,8 @@ Uses the official sarvamai Python SDK
 """
 import logging
 import base64
+import re
+import json
 from typing import Optional, Dict
 from config.config import get_config
 
@@ -71,6 +73,13 @@ class ServamService:
             try:
                 self.client = SarvamAI(api_subscription_key=self.api_key)
                 logger.info("✓ Sarvam AI SDK initialized successfully")
+                
+                # Check if client has the expected chat API
+                if hasattr(self.client, 'chat') and hasattr(self.client.chat, 'completions'):
+                    logger.info("✓ Sarvam chat.completions API available")
+                else:
+                    logger.warning("⚠️ Sarvam chat.completions API not available - may need to use alternative method")
+                    
             except Exception as e:
                 logger.error(f"Failed to initialize Sarvam AI: {e}")
                 self.client = None
@@ -80,6 +89,248 @@ class ServamService:
                 logger.warning("sarvamai library not available - install: pip install sarvamai")
             elif not self.api_key or self.api_key == "your-api-key":
                 logger.warning("Sarvam API key not configured in .env")
+
+    def _sanitize_llm_text(self, text: str) -> str:
+        """Remove reasoning/thinking blocks and return only speakable assistant text."""
+        if not text:
+            return ""
+
+        clean_text = text.strip()
+
+        # Remove normal <think>...</think> blocks
+        clean_text = re.sub(r'(?is)<think>.*?</think>\s*', '', clean_text).strip()
+
+        # If model returned an unterminated <think> block, drop everything from that marker
+        lower_text = clean_text.lower()
+        think_index = lower_text.find("<think>")
+        if think_index >= 0:
+            clean_text = clean_text[:think_index].strip()
+
+        return clean_text
+
+    def _extract_text_from_llm_response(self, response) -> str:
+        """Extract assistant text from varied SDK response formats."""
+        try:
+            def _extract_from_dict_payload(payload: dict) -> str:
+                if not isinstance(payload, dict):
+                    return ""
+
+                # Primary OpenAI-like path
+                choices = payload.get("choices") or []
+                if isinstance(choices, list) and choices:
+                    first = choices[0]
+                    if isinstance(first, dict):
+                        message = first.get("message")
+                        if isinstance(message, dict):
+                            for key in ("content", "reasoning_content", "text"):
+                                value = message.get(key)
+                                if isinstance(value, str) and value.strip():
+                                    return value
+                                if isinstance(value, list):
+                                    parts = [
+                                        item.get("text", "")
+                                        for item in value
+                                        if isinstance(item, dict) and isinstance(item.get("text"), str)
+                                    ]
+                                    joined = " ".join(part.strip() for part in parts if part and part.strip()).strip()
+                                    if joined:
+                                        return joined
+
+                        for key in ("text", "content", "output_text"):
+                            value = first.get(key)
+                            if isinstance(value, str) and value.strip():
+                                return value
+
+                # Top-level direct keys
+                for key in ("output_text", "text", "content", "reasoning_content"):
+                    value = payload.get(key)
+                    if isinstance(value, str) and value.strip():
+                        return value
+
+                # Recursive best-effort scan for first non-empty text-like field
+                preferred_keys = {"content", "text", "output_text", "reasoning_content", "transcript"}
+
+                def _recursive_scan(node) -> str:
+                    if isinstance(node, dict):
+                        for key, value in node.items():
+                            if key in preferred_keys and isinstance(value, str) and value.strip():
+                                return value
+                        for value in node.values():
+                            found = _recursive_scan(value)
+                            if found:
+                                return found
+                    elif isinstance(node, list):
+                        for item in node:
+                            found = _recursive_scan(item)
+                            if found:
+                                return found
+                    return ""
+
+                return _recursive_scan(payload)
+
+            # Dict-like responses
+            if isinstance(response, dict):
+                extracted = _extract_from_dict_payload(response)
+                if extracted:
+                    return extracted
+
+            # Object-like responses
+            if hasattr(response, "choices") and response.choices:
+                first_choice = response.choices[0]
+
+                # message.content
+                message = getattr(first_choice, "message", None)
+                if message is not None:
+                    content = getattr(message, "content", None)
+                    if isinstance(content, str) and content.strip():
+                        return content
+
+                    # Some Sarvam responses may populate reasoning_content when content is empty
+                    reasoning_content = getattr(message, "reasoning_content", None)
+                    if isinstance(reasoning_content, str) and reasoning_content.strip():
+                        return reasoning_content
+
+                    if isinstance(content, list):
+                        parts = []
+                        for item in content:
+                            if isinstance(item, dict):
+                                item_text = item.get("text") or item.get("content")
+                            else:
+                                item_text = getattr(item, "text", None) or getattr(item, "content", None)
+                            if isinstance(item_text, str) and item_text.strip():
+                                parts.append(item_text.strip())
+                        joined = " ".join(parts).strip()
+                        if joined:
+                            return joined
+
+                # delta.content (stream-like shapes)
+                delta = getattr(first_choice, "delta", None)
+                if delta is not None:
+                    delta_content = getattr(delta, "content", None)
+                    if isinstance(delta_content, str) and delta_content.strip():
+                        return delta_content
+
+                # text fallback
+                choice_text = getattr(first_choice, "text", None)
+                if isinstance(choice_text, str) and choice_text.strip():
+                    return choice_text
+
+            # Top-level text fallbacks
+            for attr in ("output_text", "text", "content"):
+                value = getattr(response, attr, None)
+                if isinstance(value, str) and value.strip():
+                    return value
+
+            # Pydantic model fallback (Sarvam SDK responses are often pydantic models)
+            if hasattr(response, "model_dump"):
+                try:
+                    dumped = response.model_dump()
+                    extracted = _extract_from_dict_payload(dumped)
+                    if extracted:
+                        return extracted
+                except Exception:
+                    pass
+
+            # Some SDK objects expose richer payload only through JSON serialization
+            if hasattr(response, "model_dump_json"):
+                try:
+                    dumped_json = response.model_dump_json()
+                    if isinstance(dumped_json, str) and dumped_json.strip():
+                        dumped = json.loads(dumped_json)
+                        extracted = _extract_from_dict_payload(dumped)
+                        if extracted:
+                            return extracted
+                except Exception:
+                    pass
+
+            # Pydantic v1 fallback
+            if hasattr(response, "dict"):
+                try:
+                    dumped = response.dict()
+                    extracted = _extract_from_dict_payload(dumped)
+                    if extracted:
+                        return extracted
+                except Exception:
+                    pass
+
+            return ""
+        except Exception:
+            return ""
+    
+    def call_llm_safe(self, messages: list, model: str = "sarvam-m", max_tokens: int = 200, temperature: float = 0.0) -> Optional[str]:
+        """
+        Safely call Sarvam LLM with error handling for different SDK versions
+        
+        Args:
+            messages: List of message dicts with 'role' and 'content'
+            model: Model name
+            max_tokens: Max tokens in response
+            temperature: Temperature for generation
+            
+        Returns:
+            Generated text or None if failed
+        """
+        if not self.client:
+            logger.error("❌ Sarvam AI client not initialized")
+            return None
+        
+        try:
+            # Try the standard OpenAI-compatible API
+            if hasattr(self.client, 'chat'):
+                logger.debug(f"Calling Sarvam LLM via chat API")
+                
+                # The Sarvam SDK uses: client.chat.completions(messages, model, ...)
+                # NOT: client.chat.completions.create(...)
+                try:
+                    # Try the .completions() method directly
+                    response = self.client.chat.completions(
+                        messages=messages,
+                        model=model,
+                        max_tokens=max_tokens,
+                        temperature=temperature
+                    )
+
+                    text = self._sanitize_llm_text(self._extract_text_from_llm_response(response))
+                    if text:
+                        logger.debug(f"✓ LLM response: {text[:80]}...")
+                        return text
+
+                    logger.warning(f"⚠️ LLM returned empty/unsupported response format: {type(response)}")
+                    return None
+                        
+                except AttributeError as ae1:
+                    logger.debug(f"   .completions() method not available, trying .completions.create()...")
+                    # Fallback: try .create() method
+                    response = self.client.chat.completions.create(
+                        messages=messages,
+                        model=model,
+                        max_tokens=max_tokens,
+                        temperature=temperature
+                    )
+
+                    text = self._sanitize_llm_text(self._extract_text_from_llm_response(response))
+                    if text:
+                        logger.debug(f"✓ LLM response (.create()): {text[:80]}...")
+                        return text
+
+                    logger.warning(f"LLM returned empty response from .create(): {type(response)}")
+                    return None
+            else:
+                logger.error(f"❌ Sarvam SDK API not compatible - missing chat interface")
+                return None
+                
+        except AttributeError as ae:
+            logger.error(f"❌ LLM API AttributeError: {str(ae)}")
+            logger.error(f"   client type: {type(self.client)}")
+            logger.error(f"   client.chat type: {type(getattr(self.client, 'chat', None))}")
+            if hasattr(self.client, 'chat'):
+                logger.error(f"   Available methods: {dir(self.client.chat)[:5]}...")
+            return None
+        except Exception as e:
+            logger.error(f"❌ LLM API error: {type(e).__name__}: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return None
     
     def speech_to_text(self, audio_data: bytes, language: str = "unknown", 
                        mode: str = "transcribe") -> Optional[Dict]:
@@ -362,21 +613,20 @@ class ServamService:
                 "content": prompt
             })
             
-            # Use correct Sarvam API: chat.completions.create (OpenAI-compatible)
-            response = self.client.chat.completions.create(
-                model="sarvam-m",
+            # Use call_llm_safe() for SDK compatibility
+            response_text = self.call_llm_safe(
                 messages=messages,
+                model="sarvam-m",
                 max_tokens=500,
                 temperature=0.7
             )
             
-            if response and hasattr(response, 'choices') and len(response.choices) > 0:
-                # Extract text from first choice
-                text = response.choices[0].message.content
-                logger.info(f"✓ Response generated ({language}): {text[:50]}...")
-                return text
+            if response_text:
+                # Response is already filtered in call_llm_safe() - no additional filtering needed
+                logger.info(f"✓ Response generated ({language}): {response_text[:50]}...")
+                return response_text
             else:
-                logger.error(f"Invalid response format: {response}")
+                logger.error(f"LLM API returned empty response")
                 return None
                 
         except Exception as e:
@@ -385,51 +635,167 @@ class ServamService:
             logger.debug(traceback.format_exc())
             return None
     
-    def analyze_sentiment(self, text: str, language: str = "en") -> Optional[dict]:
+    def _simple_keyword_sentiment(self, text: str) -> Optional[dict]:
         """
-        Analyze sentiment of text (mock implementation)
+        Simple keyword-based sentiment detection (fast, lightweight)
+        Returns None if inconclusive, allowing fallback to LLM
         
-        Note: Sarvam doesn't have built-in sentiment analysis,
-        so this returns a mock response for now
+        Args:
+            text: Text to analyze
+            
+        Returns:
+            Dict with sentiment/score if confident, None if inconclusive
+        """
+        positive_keywords = ["love", "beautiful", "excellent", "great", "amazing", "perfect", 
+                            "wonderful", "fantastic", "awesome", "good", "best", "outstanding"]
+        negative_keywords = ["hate", "bad", "terrible", "awful", "horrible", "worst", 
+                            "poor", "disappointing", "disgust", "hate", "awful", "pathetic"]
+        
+        text_lower = text.lower()
+        
+        positive_count = sum(1 for word in positive_keywords if word in text_lower)
+        negative_count = sum(1 for word in negative_keywords if word in text_lower)
+        
+        # Only return if we have strong signal (keyword match)
+        if positive_count > negative_count and positive_count > 0:
+            score = min(0.95, 0.7 + (positive_count * 0.05))
+            return {
+                "sentiment": "positive",
+                "score": score,
+                "confidence": min(0.95, 0.8 + (positive_count * 0.05)),
+                "method": "keyword"
+            }
+        elif negative_count > positive_count and negative_count > 0:
+            score = max(0.05, 0.3 - (negative_count * 0.05))
+            return {
+                "sentiment": "negative",
+                "score": score,
+                "confidence": min(0.95, 0.8 + (negative_count * 0.05)),
+                "method": "keyword"
+            }
+        
+        # Inconclusive - return None to trigger LLM fallback
+        return None
+    
+    def _llm_sentiment_detection(self, text: str, language: str = "en") -> Optional[dict]:
+        """
+        LLM-based sentiment detection (more accurate but slower)
+        Uses Sarvam LLM to analyze sentiment with context understanding
         
         Args:
             text: Text to analyze
             language: Language code
             
         Returns:
-            Sentiment analysis result
+            Dict with sentiment/score from LLM analysis
         """
         try:
-            # Simple sentiment detection based on keywords (mock)
-            positive_keywords = ["love", "beautiful", "excellent", "great", "amazing", "perfect"]
-            negative_keywords = ["hate", "bad", "terrible", "awful", "horrible", "worst"]
+            if not self.client:
+                logger.warning("LLM sentiment detection unavailable - client not initialized")
+                return None
             
-            text_lower = text.lower()
+            # Craft prompt for sentiment analysis
+            sentiment_prompt = f"""Analyze the sentiment of the following customer feedback and respond with ONLY 'positive', 'negative', or 'neutral':
+
+Customer feedback: "{text}"
+
+Respond with exactly one word: positive, negative, or neutral"""
             
-            positive_count = sum(1 for word in positive_keywords if word in text_lower)
-            negative_count = sum(1 for word in negative_keywords if word in text_lower)
+            logger.debug(f"Calling LLM for sentiment analysis of: {text[:50]}...")
             
-            if positive_count > negative_count:
+            response = self.generate_response(sentiment_prompt, language=language)
+            
+            if not response:
+                logger.warning("LLM sentiment detection failed - no response")
+                return None
+            
+            # Parse LLM response
+            response_lower = response.lower().strip()
+            
+            if "positive" in response_lower:
                 sentiment = "positive"
-                score = 0.7 + (positive_count * 0.05)
-            elif negative_count > positive_count:
+                score = 0.8
+            elif "negative" in response_lower:
                 sentiment = "negative"
-                score = 0.3 - (negative_count * 0.05)
+                score = 0.2
             else:
                 sentiment = "neutral"
                 score = 0.5
             
-            logger.info(f"✓ Sentiment: {sentiment} ({score:.2f})")
+            logger.info(f"✓ LLM Sentiment: {sentiment} (LLM response: {response[:50]}...)")
             
             return {
                 "sentiment": sentiment,
-                "score": min(1.0, max(0.0, score)),
-                "confidence": 0.75,
-                "language": language
+                "score": score,
+                "confidence": 0.85,
+                "method": "llm",
+                "llm_response": response
+            }
+            
+        except Exception as e:
+            logger.warning(f"LLM sentiment detection error: {str(e)}")
+            return None
+    
+    def analyze_sentiment(self, text: str, language: str = "en") -> Optional[dict]:
+        """
+        Hybrid sentiment analysis: keyword detection + LLM fallback
+        
+        Flow:
+        1. Try simple keyword detection (fast)
+        2. If inconclusive, use LLM (accurate but slower)
+        3. Default to neutral if both fail
+        
+        Args:
+            text: Text to analyze
+            language: Language code
+            
+        Returns:
+            Sentiment analysis result with sentiment, score, confidence, and method
+        """
+        try:
+            logger.debug(f"Analyzing sentiment: '{text[:50]}...'")
+            
+            # Step 1: Try simple keyword detection first (fast)
+            keyword_result = self._simple_keyword_sentiment(text)
+            if keyword_result:
+                result = {
+                    "sentiment": keyword_result["sentiment"],
+                    "score": keyword_result["score"],
+                    "confidence": keyword_result["confidence"],
+                    "language": language,
+                    "method": "keyword"
+                }
+                logger.info(f"✓ Sentiment (keyword): {result['sentiment']} ({result['score']:.2f}) [confidence: {result['confidence']:.2f}]")
+                return result
+            
+            # Step 2: Keyword detection was inconclusive, use LLM
+            logger.debug("Keyword detection inconclusive - using LLM fallback...")
+            llm_result = self._llm_sentiment_detection(text, language)
+            if llm_result:
+                result = {
+                    "sentiment": llm_result["sentiment"],
+                    "score": llm_result["score"],
+                    "confidence": llm_result["confidence"],
+                    "language": language,
+                    "method": "llm"
+                }
+                logger.info(f"✓ Sentiment (LLM): {result['sentiment']} ({result['score']:.2f}) [confidence: {result['confidence']:.2f}]")
+                return result
+            
+            # Step 3: Both methods failed, default to neutral
+            logger.warning(f"Both sentiment detection methods failed - defaulting to neutral")
+            return {
+                "sentiment": "neutral",
+                "score": 0.5,
+                "confidence": 0.5,
+                "language": language,
+                "method": "default"
             }
             
         except Exception as e:
             logger.error(f"Error in analyze_sentiment: {str(e)}")
+            import traceback
+            logger.debug(traceback.format_exc())
             return None
     
     def translate_text(self, text: str, source_language: str = "auto", 
