@@ -11,6 +11,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 import logging
 from datetime import datetime
 from typing import List, Optional, Dict
+import asyncio
 import uuid
 import base64
 import json
@@ -154,9 +155,9 @@ class BulkCreateCustomersResponse(BaseModel):
 class TestCallRequest(BaseModel):
     customer_id: str
     script: Optional[str] = None
-    streaming_mode: bool = False
+    streaming_mode: bool = True
     language: str = "unknown"
-    stream_call: bool = False
+    stream_call: bool = True
     
 class TestCallResponse(BaseModel):
     status: str
@@ -184,6 +185,7 @@ def _build_twilio_stream_twiml(say_text: str, stream_url: str, customer_id: str,
                 <Parameter name="conv_id" value="{conv_id}" />
             </Stream>
         </Connect>
+        <Pause length="120"/>
     </Response>'''
 
 
@@ -199,6 +201,29 @@ def _build_twilio_stream_play_twiml(audio_url: str, stream_url: str, customer_id
                 <Parameter name="conv_id" value="{conv_id}" />
             </Stream>
         </Connect>
+        <Pause length="120"/>
+    </Response>'''
+
+
+def _build_twilio_hangup_play_twiml(audio_url: str) -> str:
+    """Play closing audio and hang up — no new stream opened."""
+    safe_audio_url = audio_url.replace("&", "&amp;")
+    return f'''<?xml version="1.0" encoding="UTF-8"?>
+    <Response>
+        <Play>{safe_audio_url}</Play>
+        <Pause length="2"/>
+        <Hangup/>
+    </Response>'''
+
+
+def _build_twilio_hangup_say_twiml(text: str) -> str:
+    """Say closing text and hang up — no new stream opened."""
+    safe_text = (text or "").replace("&", "and").replace("<", " ").replace(">", " ")
+    return f'''<?xml version="1.0" encoding="UTF-8"?>
+    <Response>
+        <Say>{safe_text}</Say>
+        <Pause length="2"/>
+        <Hangup/>
     </Response>'''
 
 
@@ -1134,6 +1159,198 @@ async def twilio_media_stream_ws(
     audio_buffer = bytearray()
     response_sent = False
     empty_stt_events = 0
+    max_stt_buffer_bytes = int(config.STT_MAX_AUDIO_SECS * 8000 * 2)  # cap audio length sent to STT
+    stream_start_time = None      # set when stream 'start' event arrives
+    last_voice_time = None         # set when audio exceeds RMS threshold
+    silence_timeout_secs = 20      # reprompt/close after this many seconds of silence
+
+    # Chunked voice-activity detection (VAD) settings
+    _CHUNK_SIZE = 3200            # 0.2s at 8kHz 16-bit mono
+    _VOICE_RMS_THRESHOLD = 10     # chunk-level RMS above this = speech (Twilio phone audio is quieter)
+    _EOU_SILENCE_CHUNKS = 8       # 1.6s of consecutive silence after voice → end of utterance
+    _MIN_VOICE_CHUNKS = 2         # need ≥0.4s of voice to bother with STT
+    _MIN_STT_BYTES = 8000         # absolute minimum audio to send to STT (~0.5s)
+    _MAX_VOICE_SECS = 5.0         # send to STT after this many seconds of continuous voice (no EOU needed)
+    _voice_active = False
+    _voice_chunk_count = 0
+    _silence_after_voice = 0
+    _last_analyzed = 0            # byte offset into audio_buffer for next chunk analysis
+    _voice_start_mono = None      # monotonic time when voice onset was detected
+
+    def _get_stt_language() -> str:
+        """Return the Sarvam-compatible language code for STT from the conversation context."""
+        ctx = conversational_manager.get_conversation_context(conv_id) if conv_id else None
+        lang = ctx.get("language", "en") if ctx else "en"
+        # Sarvam STT expects codes like 'en-IN', 'hi-IN', 'ta-IN', etc.
+        lang_map = {"en": "en-IN", "hi": "hi-IN", "ta": "ta-IN", "te": "te-IN", "ml": "ml-IN"}
+        return lang_map.get(lang, "en-IN")
+
+    def _is_stt_hallucination(text: str) -> bool:
+        """Detect STT hallucination patterns like repeated words/phrases."""
+        if not text:
+            return False
+        words = text.strip().split()
+        if len(words) < 4:
+            return False
+        # If the most common word accounts for >60% of words, it's a hallucination
+        from collections import Counter
+        counts = Counter(words)
+        most_common_word, most_common_count = counts.most_common(1)[0]
+        if most_common_count / len(words) > 0.6:
+            logger.info(f"🚫 STT hallucination detected: '{most_common_word}' repeated {most_common_count}/{len(words)} times")
+            return True
+        return False
+
+    def _handle_user_text(user_text: str) -> None:
+        nonlocal response_sent, empty_stt_events
+
+        text_value = (user_text or "").strip()
+        if not text_value:
+            return
+
+        empty_stt_events = 0
+        logger.info(f"🎙️ Twilio stream STT: {text_value}")
+
+        if not conversational_manager.get_conversation_context(conv_id):
+            conversational_manager.init_conversation(conv_id, customer_id, "en")
+
+        conversational_manager.append_user_message(conv_id, text_value)
+
+        context = conversational_manager.get_conversation_context(conv_id)
+        current_lang = context.get("language", "en") if context else "en"
+        current_turn = context.get("turn_count", 0) if context else 0
+        customer_name = context.get("customer_name", "Guest") if context else "Guest"
+
+        agent_text = conversational_manager.generate_next_response(conv_id)
+        is_closing_turn = False
+        if not agent_text:
+            user_text_l = text_value.lower()
+
+            if current_turn <= 0:
+                # Turn 0: User responded to greeting → ask about visit plans
+                agent_text = conversational_manager.get_visit_plans_question(customer_name, current_lang)
+            elif current_turn == 1:
+                # Turn 1: User responded to "planning to visit again?" → yes/no handling
+                yes_markers = ["yes", "yeah", "yep", "sure", "plan", "definitely", "of course",
+                               "हां", "हाँ", "जी", "बिल्कुल", "ज़रूर", "ಹೂ", "ಹ್ಞೂ", "aha", "haan"]
+                no_markers = ["no", "nope", "not sure", "maybe", "not plan", "don't think",
+                              "नहीं", "pata nahi", "ಇಲ್ಲ", "not right now"]
+                if any(m in user_text_l for m in yes_markers):
+                    agent_text = (
+                        f"That's wonderful to hear {customer_name}! As a valued guest, we have an exclusive "
+                        f"20% loyalty discount for your next stay. We'd love to welcome you back. "
+                        f"See you soon and take care!"
+                    ) if current_lang == "en" else (
+                        f"बहुत अच्छा {customer_name}! आपके लिए अगली यात्रा पर 20% की विशेष छूट है। "
+                        f"जल्दी मिलेंगे, अपना ख्याल रखिए!"
+                    )
+                elif any(m in user_text_l for m in no_markers):
+                    agent_text = (
+                        f"No worries at all {customer_name}! Whenever you plan in the future, "
+                        f"we have a special 20% discount waiting just for you. "
+                        f"Hope to see you soon! Take care."
+                    ) if current_lang == "en" else (
+                        f"कोई बात नहीं {customer_name}! जब भी आप भविष्य में आना चाहें, "
+                        f"आपके लिए 20% की विशेष छूट तैयार है। जल्दी मिलेंगे!"
+                    )
+                else:
+                    # Ambiguous → offer discount and close
+                    agent_text = conversational_manager.get_loyalty_offer(customer_name, 20, current_lang)
+                is_closing_turn = True
+            elif current_turn == 2:
+                # Turn 2: Already offered discount, now close
+                agent_text = (
+                    f"Thank you so much for your time {customer_name}! "
+                    f"We truly value you as our guest. Have a wonderful day!"
+                ) if current_lang == "en" else (
+                    f"आपके समय के लिए बहुत धन्यवाद {customer_name}! "
+                    f"आपका दिन शुभ हो!"
+                )
+                is_closing_turn = True
+            else:
+                # Turn 3+: Graceful close
+                agent_text = (
+                    f"Thank you for chatting with us {customer_name}! Take care and see you soon!"
+                ) if current_lang == "en" else (
+                    f"बात करने के लिए धन्यवाद {customer_name}! अलविदा!"
+                )
+                is_closing_turn = True
+
+        conversational_manager.append_agent_message(conv_id, agent_text)
+
+        # Check if the LLM response itself signals a closing turn
+        if not is_closing_turn:
+            closing_signals = ["see you soon", "take care", "goodbye", "bye", "have a wonderful",
+                               "have a great", "अलविदा", "जल्दी मिलेंगे", "ख्याल रखिए"]
+            if any(sig in agent_text.lower() for sig in closing_signals):
+                is_closing_turn = True
+
+        context = conversational_manager.get_conversation_context(conv_id)
+        response_lang = context.get("language", "en") if context else "en"
+        response_audio_url = conversational_manager.text_to_speech_url(agent_text, response_lang)
+
+        if is_closing_turn:
+            # Closing turn: play audio and hang up, don't open new stream
+            logger.info(f"📞 Closing turn detected — will hang up after playing response")
+            if response_audio_url:
+                full_audio_url = f"{config.NGROK_BASE_URL}{response_audio_url}" if not response_audio_url.startswith("http") else response_audio_url
+                twiml = _build_twilio_hangup_play_twiml(full_audio_url)
+            else:
+                twiml = _build_twilio_hangup_say_twiml(agent_text)
+        else:
+            stream_http_url = f"{config.NGROK_BASE_URL}/api/v1/stream/twilio/ws"
+            stream_url = _http_to_ws_url(stream_http_url)
+            if response_audio_url:
+                full_audio_url = f"{config.NGROK_BASE_URL}{response_audio_url}" if not response_audio_url.startswith("http") else response_audio_url
+                twiml = _build_twilio_stream_play_twiml(full_audio_url, stream_url, customer_id, conv_id)
+            else:
+                twiml = _build_twilio_stream_twiml(agent_text, stream_url, customer_id, conv_id)
+
+        try:
+            twilio_service.client.calls(call_sid).update(twiml=twiml)
+            logger.info(f"✅ Twilio call updated with stream response: call_sid={call_sid}")
+            response_sent = True
+        except Exception as update_err:
+            logger.error(f"Failed updating Twilio call with response: {str(update_err)}")
+            response_sent = True
+
+    def _flush_buffered_audio(reason: str) -> None:
+        nonlocal audio_buffer
+        if len(audio_buffer) == 0 or response_sent:
+            return
+
+        buffered_rms = audioop.rms(bytes(audio_buffer), 2)
+        if buffered_rms < _VOICE_RMS_THRESHOLD:
+            logger.info(
+                f"Skipping buffered STT on {reason}: low audio energy rms={buffered_rms}, bytes={len(audio_buffer)}"
+            )
+            audio_buffer.clear()
+            return
+
+        logger.info(
+            f"Twilio stream buffered audio flush ({reason}): {len(audio_buffer)} bytes "
+            f"({len(audio_buffer) / (8000 * 2):.1f}s, rms={buffered_rms})"
+        )
+
+        if not (call_sid and conv_id and customer_id):
+            audio_buffer.clear()
+            return
+
+        try:
+            stt_result = conversational_manager.sarvam.speech_to_text(
+                audio_data=_pcm16_to_wav_bytes(bytes(audio_buffer), sample_rate=8000),
+                language=_get_stt_language(),
+            )
+            flush_text = (stt_result or {}).get("text", "").strip()
+            if flush_text and not _is_stt_hallucination(flush_text):
+                logger.info(f"Processing buffered utterance on {reason}")
+                _handle_user_text(flush_text)
+            else:
+                logger.info(f"Buffered utterance produced empty transcript on {reason}")
+        except Exception as flush_err:
+            logger.error(f"Failed buffered STT processing on {reason}: {str(flush_err)}")
+        finally:
+            audio_buffer.clear()
 
     try:
         while True:
@@ -1155,6 +1372,10 @@ async def twilio_media_stream_ws(
 
                 logger.info(f"Twilio stream start: stream_sid={stream_sid}, call_sid={call_sid}")
                 logger.info(f"Twilio stream params: customer_id={customer_id}, conv_id={conv_id}")
+
+                import time as _time
+                stream_start_time = _time.monotonic()
+                last_voice_time = stream_start_time
 
                 if not customer_id or not conv_id:
                     logger.error("Twilio stream missing customer_id/conv_id; closing websocket")
@@ -1178,125 +1399,245 @@ async def twilio_media_stream_ws(
                 except Exception:
                     continue
 
-                # Process once we have enough audio for short utterances.
-                # Slightly larger window avoids early silence-only STT calls.
-                if len(audio_buffer) < 24000:
-                    continue
-
-                if not call_sid:
+                # --- Silence timeout (checked every media event) ---
+                import time as _time
+                _now = _time.monotonic()
+                if (
+                    last_voice_time
+                    and not _voice_active
+                    and not response_sent
+                    and call_sid and conv_id and customer_id
+                    and (_now - last_voice_time) > silence_timeout_secs
+                ):
+                    logger.info(
+                        f"⏰ Silence timeout ({silence_timeout_secs}s, "
+                        f"elapsed={_now - last_voice_time:.1f}s) — triggering reprompt/close"
+                    )
                     audio_buffer.clear()
-                    continue
+                    _last_analyzed = 0
 
-                utterance_key = f"{call_sid}:{len(audio_buffer)}"
-                if utterance_key in PROCESSED_STREAM_UTTERANCES:
-                    audio_buffer.clear()
-                    continue
-                PROCESSED_STREAM_UTTERANCES.add(utterance_key)
+                    context = conversational_manager.get_conversation_context(conv_id)
+                    current_lang = context.get("language", "en") if context else "en"
+                    current_turn = context.get("turn_count", 0) if context else 0
+                    customer_name = context.get("customer_name", "Guest") if context else "Guest"
 
-                stt_result = conversational_manager.sarvam.speech_to_text(
-                    audio_data=_pcm16_to_wav_bytes(bytes(audio_buffer), sample_rate=8000),
-                    language="unknown",
-                )
-                audio_buffer.clear()
-
-                user_text = (stt_result or {}).get("text", "").strip()
-                if not user_text:
-                    empty_stt_events += 1
-                    logger.info(f"Twilio stream STT returned empty transcript (count={empty_stt_events})")
-
-                    # If STT repeatedly returns empty, reprompt user to continue the call.
-                    if empty_stt_events >= 2 and call_sid and conv_id and customer_id:
-                        context = conversational_manager.get_conversation_context(conv_id)
-                        current_lang = context.get("language", "en") if context else "en"
-                        customer_name = context.get("customer_name", "Guest") if context else "Guest"
-
+                    if current_turn >= 2:
+                        closing = {
+                            "en": f"Thank you for your time {customer_name}! We hope to see you again. Have a wonderful day!",
+                            "hi": f"\u0906\u092a\u0915\u0947 \u0938\u092e\u092f \u0915\u0947 \u0932\u093f\u090f \u092c\u0939\u0941\u0924 \u0927\u0928\u094d\u092f\u0935\u093e\u0926 {customer_name}! \u0906\u092a\u0915\u093e \u0926\u093f\u0928 \u0936\u0941\u092d \u0939\u094b!",
+                        }
+                        closing_text = closing.get(current_lang, closing["en"])
+                        response_audio_url = conversational_manager.text_to_speech_url(closing_text, current_lang)
+                        if response_audio_url:
+                            full_audio_url = f"{config.NGROK_BASE_URL}{response_audio_url}" if not response_audio_url.startswith("http") else response_audio_url
+                            twiml = _build_twilio_hangup_play_twiml(full_audio_url)
+                        else:
+                            twiml = _build_twilio_hangup_say_twiml(closing_text)
+                    else:
                         reprompts = {
-                            "en": f"I couldn't catch that {customer_name}. Are you planning to visit us again soon?",
-                            "hi": f"माफ़ कीजिए {customer_name}, आपकी बात साफ़ नहीं सुन पाया। क्या आप जल्द ही फिर से आने की योजना बना रहे हैं?",
+                            "en": f"Are you still there {customer_name}? Are you planning to visit us again soon?",
+                            "hi": f"{customer_name}, \u0915\u094d\u092f\u093e \u0906\u092a \u0935\u0939\u093e\u0901 \u0939\u0948\u0902? \u0915\u094d\u092f\u093e \u0906\u092a \u091c\u0932\u094d\u0926\u0940 \u092b\u093f\u0930 \u0938\u0947 \u0906\u0928\u0947 \u0915\u0940 \u092f\u094b\u091c\u0928\u093e \u092c\u0928\u093e \u0930\u0939\u0947 \u0939\u0948\u0902?",
                         }
                         reprompt_text = reprompts.get(current_lang, reprompts["en"])
-
                         stream_http_url = f"{config.NGROK_BASE_URL}/api/v1/stream/twilio/ws"
                         stream_url = _http_to_ws_url(stream_http_url)
                         response_audio_url = conversational_manager.text_to_speech_url(reprompt_text, current_lang)
-
                         if response_audio_url:
                             full_audio_url = f"{config.NGROK_BASE_URL}{response_audio_url}" if not response_audio_url.startswith("http") else response_audio_url
                             twiml = _build_twilio_stream_play_twiml(full_audio_url, stream_url, customer_id, conv_id)
                         else:
                             twiml = _build_twilio_stream_twiml(reprompt_text, stream_url, customer_id, conv_id)
 
+                    try:
+                        twilio_service.client.calls(call_sid).update(twiml=twiml)
+                        logger.info(f"\u2705 Twilio call updated after silence timeout (turn={current_turn})")
+                        response_sent = True
+                    except Exception as timeout_err:
+                        logger.error(f"Failed to update call after silence timeout: {str(timeout_err)}")
+                        response_sent = True
+                    continue
+
+                # --- Chunked voice-activity detection ---
+                _trigger_stt = False
+
+                while (len(audio_buffer) - _last_analyzed) >= _CHUNK_SIZE:
+                    chunk = bytes(audio_buffer[_last_analyzed:_last_analyzed + _CHUNK_SIZE])
+                    chunk_rms = audioop.rms(chunk, 2)
+                    _last_analyzed += _CHUNK_SIZE
+
+                    if chunk_rms >= _VOICE_RMS_THRESHOLD:
+                        if not _voice_active:
+                            logger.info(f"🔊 Voice onset detected: rms={chunk_rms}, buffer={len(audio_buffer)} bytes")
+                            _voice_start_mono = _now
+                        _voice_active = True
+                        _voice_chunk_count += 1
+                        _silence_after_voice = 0
+                        last_voice_time = _now
+                    elif _voice_active:
+                        _silence_after_voice += 1
+
+                # End-of-utterance: enough silence after voice
+                if _voice_active and _silence_after_voice >= _EOU_SILENCE_CHUNKS:
+                    if _voice_chunk_count >= _MIN_VOICE_CHUNKS and len(audio_buffer) >= _MIN_STT_BYTES and call_sid:
+                        logger.info(
+                            f"🛑 End-of-utterance detected: {_voice_chunk_count} voice chunks, "
+                            f"{_silence_after_voice} silence chunks"
+                        )
+                        _trigger_stt = True
+                    else:
+                        logger.info(
+                            f"Discarding short voice segment: chunks={_voice_chunk_count}, "
+                            f"bytes={len(audio_buffer)}"
+                        )
+                        audio_buffer.clear()
+                    _voice_active = False
+                    _voice_chunk_count = 0
+                    _silence_after_voice = 0
+                    _last_analyzed = 0
+                    _voice_start_mono = None
+
+                # Voice duration trigger: send to STT after N seconds of continuous voice
+                # even without a clear end-of-utterance silence pause
+                if (
+                    _voice_active
+                    and _voice_start_mono
+                    and (_now - _voice_start_mono) >= _MAX_VOICE_SECS
+                    and len(audio_buffer) >= _MIN_STT_BYTES
+                    and call_sid
+                ):
+                    logger.info(
+                        f"⏱️ Voice duration trigger ({_now - _voice_start_mono:.1f}s): "
+                        f"{_voice_chunk_count} voice chunks, {len(audio_buffer)} bytes"
+                    )
+                    _trigger_stt = True
+                    _voice_active = False
+                    _voice_chunk_count = 0
+                    _silence_after_voice = 0
+                    _last_analyzed = 0
+                    _voice_start_mono = None
+
+                # Long continuous speech — send what we have so the caller isn't waiting
+                if _voice_active and len(audio_buffer) >= max_stt_buffer_bytes and call_sid:
+                    logger.info(
+                        f"📦 Buffer cap trigger: {len(audio_buffer)} bytes"
+                    )
+                    _trigger_stt = True
+                    _voice_active = False
+                    _voice_chunk_count = 0
+                    _silence_after_voice = 0
+                    _last_analyzed = 0
+                    _voice_start_mono = None
+
+                # Drop prolonged silence (no voice detected at all)
+                if not _voice_active and not _trigger_stt and len(audio_buffer) >= max_stt_buffer_bytes:
+                    logger.info(
+                        f"Dropping silence-only buffer: bytes={len(audio_buffer)}"
+                    )
+                    audio_buffer.clear()
+                    _last_analyzed = 0
+                    continue
+
+                if not _trigger_stt:
+                    continue
+
+                # --- Send voiced audio to STT ---
+                if not call_sid:
+                    audio_buffer.clear()
+                    _last_analyzed = 0
+                    continue
+
+                # Cap buffer
+                if len(audio_buffer) > max_stt_buffer_bytes:
+                    audio_buffer = bytearray(bytes(audio_buffer)[-max_stt_buffer_bytes:])
+
+                logger.info(
+                    f"🎯 Sending utterance to STT: {len(audio_buffer)} bytes "
+                    f"({len(audio_buffer) / (8000 * 2):.1f}s)"
+                )
+
+                utterance_key = f"{call_sid}:{len(audio_buffer)}"
+                if utterance_key in PROCESSED_STREAM_UTTERANCES:
+                    audio_buffer.clear()
+                    _last_analyzed = 0
+                    continue
+                PROCESSED_STREAM_UTTERANCES.add(utterance_key)
+
+                wav_data = _pcm16_to_wav_bytes(bytes(audio_buffer), sample_rate=8000)
+                stt_lang = _get_stt_language()
+                loop = asyncio.get_running_loop()
+                stt_result = await loop.run_in_executor(
+                    None,
+                    lambda: conversational_manager.sarvam.speech_to_text(
+                        audio_data=wav_data, language=stt_lang,
+                    ),
+                )
+                audio_buffer.clear()
+                _last_analyzed = 0
+
+                user_text = (stt_result or {}).get("text", "").strip()
+                # Treat hallucinated repeated-word output as empty
+                if user_text and _is_stt_hallucination(user_text):
+                    user_text = ""
+                if not user_text:
+                    empty_stt_events += 1
+                    logger.info(f"Twilio stream STT returned empty transcript (count={empty_stt_events})")
+
+                    # If STT repeatedly returns empty, reprompt or close based on turn.
+                    if empty_stt_events >= 2 and call_sid and conv_id and customer_id:
+                        context = conversational_manager.get_conversation_context(conv_id)
+                        current_lang = context.get("language", "en") if context else "en"
+                        current_turn = context.get("turn_count", 0) if context else 0
+                        customer_name = context.get("customer_name", "Guest") if context else "Guest"
+
+                        if current_turn >= 2:
+                            # Conversation already advanced past offer — close gracefully
+                            closing = {
+                                "en": f"Thank you for your time {customer_name}! We hope to see you again. Have a wonderful day!",
+                                "hi": f"आपके समय के लिए धन्यवाद {customer_name}! जल्दी मिलेंगे, अपना ख्याल रखिए!",
+                            }
+                            closing_text = closing.get(current_lang, closing["en"])
+                            response_audio_url = conversational_manager.text_to_speech_url(closing_text, current_lang)
+                            if response_audio_url:
+                                full_audio_url = f"{config.NGROK_BASE_URL}{response_audio_url}" if not response_audio_url.startswith("http") else response_audio_url
+                                twiml = _build_twilio_hangup_play_twiml(full_audio_url)
+                            else:
+                                twiml = _build_twilio_hangup_say_twiml(closing_text)
+                        else:
+                            reprompts = {
+                                "en": f"I couldn't catch that {customer_name}. Are you planning to visit us again soon?",
+                                "hi": f"माफ़ कीजिए {customer_name}, आपकी बात साफ़ नहीं सुन पाया। क्या आप जल्द ही फिर से आने की योजना बना रहे हैं?",
+                            }
+                            reprompt_text = reprompts.get(current_lang, reprompts["en"])
+                            stream_http_url = f"{config.NGROK_BASE_URL}/api/v1/stream/twilio/ws"
+                            stream_url = _http_to_ws_url(stream_http_url)
+                            response_audio_url = conversational_manager.text_to_speech_url(reprompt_text, current_lang)
+                            if response_audio_url:
+                                full_audio_url = f"{config.NGROK_BASE_URL}{response_audio_url}" if not response_audio_url.startswith("http") else response_audio_url
+                                twiml = _build_twilio_stream_play_twiml(full_audio_url, stream_url, customer_id, conv_id)
+                            else:
+                                twiml = _build_twilio_stream_twiml(reprompt_text, stream_url, customer_id, conv_id)
+
                         try:
                             twilio_service.client.calls(call_sid).update(twiml=twiml)
-                            logger.info(f"✅ Twilio call reprompted after empty STT: call_sid={call_sid}")
+                            logger.info(f"✅ Twilio call updated after empty STT (turn={current_turn}): call_sid={call_sid}")
                             response_sent = True
                         except Exception as update_err:
-                            logger.error(f"Failed to reprompt Twilio call after empty STT: {str(update_err)}")
+                            logger.error(f"Failed to update Twilio call after empty STT: {str(update_err)}")
+                            response_sent = True  # prevent further attempts
 
                     continue
 
-                empty_stt_events = 0
-
-                logger.info(f"🎙️ Twilio stream STT: {user_text}")
-
-                if not conversational_manager.get_conversation_context(conv_id):
-                    conversational_manager.init_conversation(conv_id, customer_id, "en")
-
-                conversational_manager.append_user_message(conv_id, user_text)
-
-                context = conversational_manager.get_conversation_context(conv_id)
-                current_lang = context.get("language", "en") if context else "en"
-                current_turn = context.get("turn_count", 0) if context else 0
-                customer_name = context.get("customer_name", "Guest") if context else "Guest"
-
-                agent_text = conversational_manager.generate_next_response(conv_id)
-                if not agent_text:
-                    user_text_l = user_text.lower()
-
-                    # Deterministic first follow-up: after "I'm fine" style response, ask visit plan next
-                    fine_markers = ["i'm fine", "im fine", "i am fine", "fine", "ठीक", "फाइन", "आई एम फाइन"]
-                    if current_turn == 0 and any(marker in user_text_l for marker in fine_markers):
-                        agent_text = conversational_manager.get_visit_plans_question(customer_name, current_lang)
-                    elif current_turn <= 1:
-                        agent_text = conversational_manager.get_visit_plans_question(customer_name, current_lang)
-                    elif current_turn == 2:
-                        agent_text = conversational_manager.get_loyalty_offer(customer_name, 20, current_lang)
-                    else:
-                        closing_fallbacks = {
-                            "en": "Thank you for your time. We have a special offer ready for your next visit.",
-                            "hi": "आपके समय के लिए धन्यवाद। आपकी अगली यात्रा के लिए हमारा विशेष ऑफर तैयार है।",
-                        }
-                        agent_text = closing_fallbacks.get(current_lang, closing_fallbacks["en"])
-
-                conversational_manager.append_agent_message(conv_id, agent_text)
-
-                # Reconnect stream after speaking response (Sarvam TTS playback, not Twilio Alice voice)
-                stream_http_url = f"{config.NGROK_BASE_URL}/api/v1/stream/twilio/ws"
-                stream_url = _http_to_ws_url(stream_http_url)
-
-                context = conversational_manager.get_conversation_context(conv_id)
-                response_lang = context.get("language", "en") if context else "en"
-                response_audio_url = conversational_manager.text_to_speech_url(agent_text, response_lang)
-
-                if response_audio_url:
-                    full_audio_url = f"{config.NGROK_BASE_URL}{response_audio_url}" if not response_audio_url.startswith("http") else response_audio_url
-                    twiml = _build_twilio_stream_play_twiml(full_audio_url, stream_url, customer_id, conv_id)
-                else:
-                    twiml = _build_twilio_stream_twiml(agent_text, stream_url, customer_id, conv_id)
-
-                try:
-                    twilio_service.client.calls(call_sid).update(twiml=twiml)
-                    logger.info(f"✅ Twilio call updated with stream response: call_sid={call_sid}")
-                    response_sent = True
-                except Exception as update_err:
-                    logger.error(f"Failed updating Twilio call with response: {str(update_err)}")
-                    response_sent = True
+                _handle_user_text(user_text)
 
             if event_type == "stop":
+                if len(audio_buffer) > 0 and not response_sent:
+                    _flush_buffered_audio("stream stop")
+
                 logger.info(f"Twilio stream stop: stream_sid={stream_sid}, call_sid={call_sid}")
                 break
 
     except WebSocketDisconnect:
+        _flush_buffered_audio("websocket disconnect")
         logger.info("Twilio media websocket disconnected")
     except Exception as e:
         logger.error(f"Twilio media stream error: {str(e)}")
@@ -1311,7 +1652,7 @@ def test_call_to_customer(test_call_req: TestCallRequest):
     Make a test conversational call.
 
     Modes:
-    - Twilio call mode (default): Existing phone-call flow
+    - Twilio call mode (default): Twilio Media Streams live call flow (no recording)
     - Streaming mode: Returns LiveKit streaming websocket bridge details
     
     Flow:
@@ -1336,8 +1677,11 @@ def test_call_to_customer(test_call_req: TestCallRequest):
         
         logger.info(f"🎙️ Initiating test call for {customer.customer_id} ({customer.phone})")
 
+        # Treat stream_call as an explicit signal to use streaming mode even if streaming_mode is omitted
+        effective_streaming_mode = test_call_req.streaming_mode or test_call_req.stream_call
+
         # Streaming mode with live call: place Twilio call and stream audio directly (no recording)
-        if test_call_req.streaming_mode and test_call_req.stream_call:
+        if effective_streaming_mode and test_call_req.stream_call:
             call_sid = f"CONV_{uuid.uuid4().hex[:12]}"
 
             context = conversational_manager.init_conversation(call_sid, test_call_req.customer_id, "en")
@@ -1388,7 +1732,7 @@ def test_call_to_customer(test_call_req: TestCallRequest):
             )
 
         # Streaming test mode: return websocket session details for LiveKit bridge
-        if test_call_req.streaming_mode:
+        if effective_streaming_mode:
             session_id = f"lk_{uuid.uuid4().hex[:12]}"
             base_url = (config.NGROK_BASE_URL or "http://localhost:8000").strip().rstrip("/")
             ws_base = base_url.replace("https://", "wss://").replace("http://", "ws://")

@@ -6,6 +6,7 @@ import logging
 import base64
 import re
 import json
+import time
 from typing import Optional, Dict
 from config.config import get_config
 
@@ -71,8 +72,10 @@ class ServamService:
         # Initialize Sarvam AI client with official SDK
         if SARVAMAI_AVAILABLE and self.api_key and self.api_key != "your-api-key":
             try:
-                self.client = SarvamAI(api_subscription_key=self.api_key)
-                logger.info("✓ Sarvam AI SDK initialized successfully")
+                self.stt_timeout = config.STT_TIMEOUT
+                self.stt_retries = config.STT_RETRIES
+                self.client = SarvamAI(api_subscription_key=self.api_key, timeout=self.stt_timeout)
+                logger.info(f"✓ Sarvam AI SDK initialized (timeout={self.stt_timeout}s, retries={self.stt_retries})")
                 
                 # Check if client has the expected chat API
                 if hasattr(self.client, 'chat') and hasattr(self.client.chat, 'completions'):
@@ -348,47 +351,58 @@ class ServamService:
         if not self.client:
             logger.error("Sarvam AI client not initialized")
             return None
-        
-        try:
-            from io import BytesIO
-            
-            # Create a file-like object from bytes
-            audio_file = BytesIO(audio_data)
-            audio_file.name = "audio.wav"
-            
-            # Call Sarvam API with official SDK
-            response = self.client.speech_to_text.transcribe(
-                file=audio_file,
-                model="saaras:v3",
-                mode=mode,  # transcribe, translate, verbatim, translit, codemix
-                language_code=language  # "unknown" for auto-detect
-            )
-            
-            if response and hasattr(response, 'request_id'):
-                # Get transcript from response (could be 'transcript' or 'text')
-                text = getattr(response, 'transcript', getattr(response, 'text', ''))
-                detected_lang = getattr(response, 'language', language)
-                confidence = getattr(response, 'confidence', 0.95)
-                
-                # Store detected language for later use
-                self.detected_language = detected_lang
-                
-                logger.info(f"✓ STT successful: {detected_lang} (confidence: {confidence:.2%})")
-                
-                return {
-                    'text': text,
-                    'language': detected_lang,
-                    'confidence': confidence,
-                    'mode': mode,
-                    'request_id': getattr(response, 'request_id', '')
-                }
-            else:
-                logger.error(f"STT failed: {response}")
-                return None
-                
-        except Exception as e:
-            logger.error(f"Error in speech_to_text: {str(e)}")
-            return None
+
+        retries = getattr(self, 'stt_retries', 2)
+        last_err = None
+
+        for attempt in range(1, retries + 1):
+            try:
+                from io import BytesIO
+
+                audio_file = BytesIO(audio_data)
+                audio_file.name = "audio.wav"
+
+                t0 = time.monotonic()
+                response = self.client.speech_to_text.transcribe(
+                    file=audio_file,
+                    model="saaras:v3",
+                    mode=mode,
+                    language_code=language
+                )
+                elapsed = time.monotonic() - t0
+
+                if response and hasattr(response, 'request_id'):
+                    text = getattr(response, 'transcript', getattr(response, 'text', ''))
+                    detected_lang = getattr(response, 'language', language)
+                    confidence = getattr(response, 'confidence', 0.95)
+
+                    self.detected_language = detected_lang
+
+                    logger.info(
+                        f"✓ STT successful in {elapsed:.1f}s: {detected_lang} "
+                        f"(confidence: {confidence:.2%}), "
+                        f"transcript={repr(text[:120]) if text else '<empty>'}"
+                    )
+
+                    return {
+                        'text': text,
+                        'language': detected_lang,
+                        'confidence': confidence,
+                        'mode': mode,
+                        'request_id': getattr(response, 'request_id', '')
+                    }
+                else:
+                    logger.error(f"STT failed (attempt {attempt}/{retries}): {response}")
+                    last_err = f"empty response: {response}"
+
+            except Exception as e:
+                last_err = e
+                logger.warning(f"STT attempt {attempt}/{retries} failed ({type(e).__name__}): {e}")
+                if attempt < retries:
+                    time.sleep(min(attempt * 0.5, 2))  # brief back-off
+
+        logger.error(f"STT failed after {retries} attempts: {last_err}")
+        return None
     
     def text_to_speech(self, text: str, target_language: str = "en-IN", 
                       speaker: str = "aditya", model: str = "bulbul:v3") -> Optional[bytes]:

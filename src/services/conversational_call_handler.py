@@ -45,6 +45,73 @@ class ConversationalCallManager:
         self.sarvam = ServamService()
         self.agent = RelationshipManagerAgent()
         self.session = get_session()
+
+    def _should_switch_language(self, current_language: str, detected_language: str, text: str) -> bool:
+        """
+        Decide whether to switch conversation language for this turn.
+
+        Prevent abrupt switches on short/ambiguous utterances like "और", "ok", "haan".
+        Only allow switching between English and Hindi freely; other languages
+        require very strong evidence (STT often hallucinates ta/te/ml/kn on English speech).
+        """
+        if not detected_language or detected_language == current_language:
+            return False
+
+        stripped_text = (text or "").strip()
+        if not stripped_text:
+            return False
+
+        # Only allow en↔hi switches freely; block ta/te/ml/kn unless overwhelming evidence
+        allowed_easy_switch = {"en", "hi"}
+        if detected_language not in allowed_easy_switch:
+            logger.info(f"🌍 Blocking language switch to {detected_language} (only en/hi allowed without strong evidence)")
+            return False
+
+        words = stripped_text.split()
+        text_len = len(stripped_text)
+        latin_letters = sum(1 for c in stripped_text if c.isascii() and c.isalpha())
+        devanagari_chars = sum(1 for c in stripped_text if 0x0900 <= ord(c) <= 0x097F)
+
+        # Require stronger signal for very short interjections.
+        is_short_utterance = text_len < 12 or len(words) <= 2
+        if is_short_utterance:
+            if detected_language == "en":
+                return latin_letters >= 6
+            if detected_language == "hi":
+                return devanagari_chars >= 6
+            return False
+
+        return True
+
+    def _ensure_complete_spoken_response(self, text: str, language: str) -> str:
+        """
+        Normalize LLM output so TTS doesn't speak clipped mid-clause responses.
+        """
+        normalized = (text or "").strip()
+        if not normalized:
+            return normalized
+
+        terminal_marks = (".", "!", "?", "।")
+        if normalized.endswith(terminal_marks):
+            return normalized
+
+        lang = (language or "en").lower()
+
+        if lang == "en":
+            dangling_endings = (
+                "to", "and", "or", "but", "because", "so", "with", "for", "of", "that",
+                "which", "ensure", "ensure that", "make sure", "help"
+            )
+            lower = normalized.lower().rstrip()
+            for ending in dangling_endings:
+                if lower.endswith(f" {ending}") or lower == ending:
+                    return f"{normalized} your next stay is even better."
+            return f"{normalized}."
+
+        if lang == "hi":
+            return f"{normalized}।"
+
+        return f"{normalized}."
     
     # ==================== LANGUAGE DETECTION (Script-based) ====================
     
@@ -118,15 +185,17 @@ HOW TO RESPOND (CRITICAL):
 2. ACKNOWLEDGE PREVIOUS ANSWERS - Reference what they told you earlier in the call
 3. NATURAL FLOW - If they answered about experience, ask about specific details, not "tell me about experience" again
 4. ONE IDEA PER TURN - Keep responses SHORT: 1-2 sentences max
-5. CONTINUE CONVERSATION - Build on previous turns, don't ask the same question twice
+5. NEVER REPEAT - Do not say the same thing you already said in a previous turn
 6. BE WARM & GENUINE - Like talking to a friend, remember details they shared
 
-CONVERSATION GUIDELINES:
-- Acknowledge their mood/experience first, then follow up naturally
-- If they shared an experience → ask specific follow-ups ("glad/sorry to hear... did you like...")
-- If they shared future plans → build on that (timing, preferences, booking)
-- If hesitant → understand why before offering discount
-- Never jump to new topics - flow naturally from their answer
+CONVERSATION FLOW (follow this structure):
+Turn 1: Acknowledge how they are doing, then ask "Are you planning to visit us again soon?"
+Turn 2 (if they say YES): "That's wonderful! As a valued guest, we have an exclusive 20% loyalty discount for your next stay. We'd love to welcome you back. See you soon and take care!"
+Turn 2 (if they say NO / not sure): "No worries! Whenever you plan in the future, we have a special 20% discount waiting just for you. Hope to see you soon! Take care."
+Turn 2 (if negative experience): Apologize sincerely, offer 30% recovery discount, say goodbye warmly.
+Turn 3+: Thank them and say goodbye. The call should end naturally after the discount offer.
+
+IMPORTANT: Once you have offered the discount and said goodbye, do NOT continue the conversation. End warmly.
 
 CRITICAL LANGUAGE RULE:
 - Respond ONLY in {language}
@@ -191,12 +260,7 @@ Language Context: {language}"""
             if not is_silence:
                 detected_lang = self.detect_language_from_script(user_text)
 
-                # Guard against abrupt non-English -> English flips for short/ambiguous text.
-                if context["language"] != "en" and detected_lang == "en":
-                    if len((user_text or "").strip()) < 8:
-                        detected_lang = context["language"]
-
-                if detected_lang != context["language"]:
+                if self._should_switch_language(context["language"], detected_lang, user_text):
                     logger.info(f"🌍 Language detected: {context['language']} → {detected_lang}")
                     context["language"] = detected_lang
             
@@ -472,6 +536,9 @@ Conversation so far: {len(context['messages'])} messages. Reference previous ans
                 # 🧠 Strip thinking tags if present (some LLMs return reasoning)
                 # e.g., <think>reasoning...</think>actual response
                 agent_text = re.sub(r'<think>.*?</think>\s*', '', agent_text, flags=re.DOTALL).strip()
+
+                # Ensure response is complete and speakable before TTS playback.
+                agent_text = self._ensure_complete_spoken_response(agent_text, lang)
                 
                 if len(agent_text) < 3:
                     logger.warning(f"LLM returned very short response after filtering: '{agent_text}'")
