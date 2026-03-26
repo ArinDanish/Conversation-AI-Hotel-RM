@@ -1,41 +1,78 @@
-# Beacon Hotel Relationship Manager - README
+# Beacon Hotel Relationship Manager - AI Voice Agent
 
 ## 📋 Project Overview
 
-**Beacon Hotel Relationship Manager** is an intelligent AI-powered customer relationship management system designed to retain customers through strategic, personalized outreach. The system analyzes customer call history, predicts churn risk, and orchestrates automated calls with Twilio to offer tailored discounts and booking incentives.
+**Beacon Hotel Relationship Manager** is an AI-powered voice agent that makes outbound phone calls to hotel customers for relationship management. The system uses **LiveKit SIP** for real-time voice communication, **Sarvam AI** for Speech-to-Text, LLM reasoning, and Text-to-Speech, and **Twilio** for PSTN connectivity. The AI agent "Raj" calls customers, checks in on their experience, and offers personalized loyalty discounts.
 
 ### 🎯 Key Features
 
-- **AI-Powered Analysis**: Analyzes call history and customer engagement using advanced NLP
-- **Churn Risk Prediction**: Predictive scoring to identify at-risk customers
-- **Intelligent Call Scheduling**: Automatically schedules optimal times to call customers based on historical engagement patterns
-- **Personalized Call Scripts**: Generates custom scripts using Servam LLM based on customer history
-- **Speech Processing**: STT and TTS integration for natural conversations
-- **Twilio Integration**: Make real calls to customers with recorded conversations
-- **Call Logging**: Complete call history tracking with sentiment analysis
-- **Discount Strategy**: Intelligent discount recommendations based on churn risk and loyalty
-- **REST API**: Full-featured API for integration with other systems
+- **Outbound AI Voice Calls**: Automated phone calls via Twilio SIP → LiveKit → AI Agent
+- **Real-time STT/TTS Pipeline**: Sarvam saaras:v3 (STT) → sarvam-m (LLM) → bulbul:v3 (TTS)
+- **Personalized Conversations**: Agent "Raj" speaks naturally with customer context (visits, loyalty score, preferences)
+- **Tiered Discount Strategy**: 20% (5+ visits), 15% (2-4 visits), 10% (new customers)
+- **Automatic Call Ending**: Goodbye detection + max turn limit with SIP hangup
+- **Audio Recording**: Records both caller and agent audio as WAV files
+- **Multilingual Support**: English and Hindi (en-IN / hi-IN)
+- **Churn Risk Analysis**: Customer analysis with engagement scoring
+- **REST API**: FastAPI with automatic OpenAPI docs
+- **Think-Tag Stripping**: Robust handling of LLM reasoning output (sarvam-m always produces `<think>` blocks)
+
+---
+
+## 🏗️ Architecture
+
+```
+┌──────────────┐     SIP/PSTN      ┌──────────────┐    WebRTC     ┌──────────────────────┐
+│   Customer   │ ◄──────────────── │    Twilio     │ ◄──────────► │   LiveKit Cloud      │
+│   Phone      │                   │  SIP Trunk    │              │   (India South)      │
+└──────────────┘                   └──────────────┘              └──────────┬───────────┘
+                                                                           │
+                                                                    WebRTC │ Audio
+                                                                           │
+                                                                 ┌─────────▼───────────┐
+                                                                 │   AI Agent (Python)  │
+                                                                 │                      │
+                                                                 │  Caller Audio ──►    │
+                                                                 │  Sarvam STT ──►     │
+                                                                 │  Sarvam LLM ──►     │
+                                                                 │  Sarvam TTS ──►     │
+                                                                 │  ──► LiveKit Audio   │
+                                                                 └──────────────────────┘
+```
+
+**Call Flow:**
+1. FastAPI endpoint triggers outbound call
+2. LiveKit room is created, AI agent dispatched
+3. SIP call placed via Twilio to customer's phone
+4. Customer audio → Sarvam STT (saaras:v3) → text
+5. Text → Sarvam LLM (sarvam-m, `reasoning_effort="low"`) → response (think-tags stripped)
+6. Response → Sarvam TTS (bulbul:v3, speaker "aditya") → audio
+7. Audio played back to customer via LiveKit → SIP → Twilio → PSTN
+8. Goodbye detected → SIP participant removed → call ends
 
 ---
 
 ## 🛠️ Technology Stack
 
 ### Core Technologies
-- **Python 3.8+**: Main programming language
-- **Flask**: REST API framework
+- **Python 3.11**: Main programming language
+- **FastAPI 0.104.1**: REST API framework with automatic OpenAPI docs
+- **Uvicorn**: ASGI server (port 8000)
 - **SQLAlchemy**: ORM for database management
-- **SQLite/PostgreSQL**: Data storage
+- **SQLite**: Data storage
 
-### AI & LLM Services
-- **Servam API**: 
-  - STT (Speech-to-Text) - Converts customer speech to text
-  - TTS (Text-to-Speech) - Generates natural voice responses
-  - LLM - Generates personalized call scripts and business logic AI
-- **OpenAI/LLM Integration**: For NLP and decision-making
+### Voice & AI Services
+- **Sarvam AI** (sarvamai v0.1.27):
+  - **STT**: saaras:v3 — Speech-to-Text (REST API, en-IN/hi-IN)
+  - **TTS**: bulbul:v3 — Text-to-Speech (speaker "aditya", male Indian voice, linear16, 16kHz)
+  - **LLM**: sarvam-m — Reasoning model with `reasoning_effort="low"` and streaming support
 
-### Communication
-- **Twilio**: Voice calls and SMS messaging
-- **WebSocket**: Real-time communication
+### Real-time Communication
+- **LiveKit** (livekit v1.1.3, livekit-agents v1.5.1, livekit-api v1.1.0):
+  - LiveKit Cloud (India South region)
+  - SIP service for PSTN bridging
+  - WebRTC rooms for real-time audio
+- **Twilio**: Elastic SIP Trunking for PSTN connectivity
 
 ### Analysis & Reporting
 - **Pandas**: Data analysis
@@ -46,29 +83,42 @@
 ## 📁 Project Structure
 
 ```
-beacon-hotel-relationship-manager/
-├── src/                          # Source code
+Conversation-AI-Hotel-RM/
+├── src/                              # Source code
+│   ├── main_fastapi.py               # FastAPI REST API application (port 8000)
+│   ├── main.py                       # Legacy Flask application
 │   ├── agents/
-│   │   └── relationship_manager_agent.py    # Main AI agent for customer analysis
+│   │   └── relationship_manager_agent.py  # Customer analysis & churn scoring
 │   ├── services/
-│   │   ├── servam_service.py          # Servam API integration (STT/TTS/LLM)
-│   │   └── twilio_service.py          # Twilio call management
+│   │   ├── livekit_sip_agent.py      # ★ Main SIP voice agent (STT→LLM→TTS pipeline)
+│   │   ├── livekit_streaming_service.py   # LiveKit streaming helpers
+│   │   ├── servam_service.py         # Sarvam API wrapper
+│   │   ├── twilio_service.py         # Twilio call management
+│   │   ├── audio_service.py          # Audio processing utilities
+│   │   ├── conversational_call_handler.py # Conversational call flow
+│   │   └── dify_agent.py             # Dify agent integration
 │   ├── models/
-│   │   └── database.py                # SQLAlchemy database models
-│   ├── utils/
-│   │   ├── call_logger.py             # Call logging and tracking
-│   │   └── dummy_data_generator.py    # Generate test data
-│   └── main.py                   # Flask REST API application
+│   │   └── database.py               # SQLAlchemy models (Customer, CallHistory, etc.)
+│   └── utils/
+│       ├── call_logger.py            # Call logging and tracking
+│       └── dummy_data_generator.py   # Generate test customer data
 ├── config/
-│   └── config.py                 # Configuration management
-├── data/                         # Data storage
-│   └── dummy_data.xlsx           # Sample customer and call data
-├── logs/                         # Application logs
-├── tests/                        # Unit tests
-├── requirements.txt              # Python dependencies
-├── .env.example                  # Environment variables template
-└── README.md                     # This file
-
+│   └── config.py                     # Configuration management (.env loader)
+├── run_agent.py                      # LiveKit agent worker launcher
+├── audio/                            # Recorded call audio (caller + agent WAV files)
+├── logs/
+│   └── agent_session.log             # Agent session logs (file-based logging)
+├── data/                             # Data storage (SQLite DB, Excel data)
+├── scripts/
+│   └── generate_excel_data.py        # Excel data generation script
+├── examples/
+│   └── multilingual_examples.py      # Multilingual usage examples
+├── tests/
+│   └── test_relationship_manager.py  # Unit tests
+├── requirements.txt                  # Python dependencies
+├── setup.bat                         # Windows setup script
+├── setup.sh                          # Linux/macOS setup script
+└── README.md                         # This file
 ```
 
 ---
@@ -76,26 +126,27 @@ beacon-hotel-relationship-manager/
 ## ⚙️ Installation & Setup
 
 ### Prerequisites
-- Python 3.8 or higher
+- Python 3.11+
 - pip (Python package manager)
-- Twilio account (for making calls)
-- Servam API credentials (for STT/TTS/LLM)
+- Twilio account with Elastic SIP Trunking
+- Sarvam AI API key
+- LiveKit Cloud account (or self-hosted LiveKit server)
 
 ### Step 1: Clone and Setup
 
 ```bash
 # Clone repository
 git clone <repository_url>
-cd beacon-hotel-relationship-manager
+cd Conversation-AI-Hotel-RM
 
 # Create virtual environment
-python -m venv venv
+python -m venv .venv
 
 # Activate virtual environment
 # On Windows:
-venv\Scripts\activate
+.venv\Scripts\activate
 # On macOS/Linux:
-source venv/bin/activate
+source .venv/bin/activate
 ```
 
 ### Step 2: Install Dependencies
@@ -106,47 +157,83 @@ pip install -r requirements.txt
 
 ### Step 3: Configure Environment
 
-```bash
-# Copy environment template
-cp .env.example .env
+Create a `.env` file in the project root:
 
-# Edit .env with your credentials
-# Required:
-# - SERVAM_API_KEY
-# - SERVAM_API_URL
-# - TWILIO_ACCOUNT_SID
-# - TWILIO_AUTH_TOKEN
-# - TWILIO_PHONE_NUMBER
+```bash
+# Sarvam AI Configuration
+SARVAM_API_KEY=your-sarvam-api-key
+
+# LiveKit Configuration
+LIVEKIT_URL=wss://your-project.livekit.cloud
+LIVEKIT_API_KEY=your-livekit-api-key
+LIVEKIT_API_SECRET=your-livekit-api-secret
+LIVEKIT_SIP_TRUNK_ID=your-sip-trunk-id
+
+# Twilio Configuration
+TWILIO_ACCOUNT_SID=your-twilio-sid
+TWILIO_AUTH_TOKEN=your-twilio-token
+TWILIO_PHONE_NUMBER=+1XXXXXXXXXX
+
+# Database
+DATABASE_URL=sqlite:///beacon_hotel.db
+
+# Environment
+ENVIRONMENT=development
+DEBUG=True
 ```
 
-### Step 4: Initialize Database
+### Step 4: Initialize Database & Dummy Data
 
 ```bash
 python -c "from src.models.database import init_db; init_db()"
+python -c "from src.utils.dummy_data_generator import initialize_dummy_data; initialize_dummy_data()"
 ```
 
-### Step 5: Generate Dummy Data (Optional)
-
+Or via API after starting the server:
 ```bash
-python -c "from src.utils.dummy_data_generator import initialize_dummy_data; initialize_dummy_data()"
+curl -X POST http://localhost:8000/api/v1/init/dummy-data
 ```
 
 ---
 
 ## 🚀 Running the Application
 
-### Start Flask API Server
+### 1. Start the FastAPI Server
 
 ```bash
-python src/main.py
+python src/main_fastapi.py
 ```
 
-The API will be available at `http://localhost:5000`
+The API will be available at `http://localhost:8000` with interactive docs at `http://localhost:8000/docs`.
 
-### Run Tests
+### 2. Start the LiveKit Agent Worker
+
+In a separate terminal:
 
 ```bash
-python -m pytest tests/ -v
+python run_agent.py dev
+```
+
+This starts the LiveKit agent worker that handles voice calls.
+
+### 3. Make a Test Call
+
+```bash
+curl -X POST http://localhost:8000/api/v1/calls/test-livekit-sip \
+  -H "Content-Type: application/json" \
+  -d '{"customer_id": "CUST1052", "language": "en"}'
+```
+
+### 4. Monitor Logs
+
+Agent logs are written to `logs/agent_session.log` (livekit-agents captures child process stdout):
+
+```powershell
+# Windows (real-time tail):
+Get-Content logs/agent_session.log -Tail 50 -Wait
+
+# Linux/macOS:
+tail -f logs/agent_session.log
 ```
 
 ---
@@ -154,249 +241,179 @@ python -m pytest tests/ -v
 ## 📡 API Endpoints
 
 ### Health & System
-- `GET /health` - Server health check
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/` | API info |
+| `GET` | `/health` | Server health check |
 
 ### Customer Management
-- `GET /api/v1/customers` - Get all customers
-- `GET /api/v1/customers/<customer_id>` - Get customer details
-- `GET /api/v1/customers/<customer_id>/analysis` - Analyze customer relationship
-- `GET /api/v1/customers/<customer_id>/call-history` - Get customer's call history
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/api/v1/customers` | List all customers |
+| `GET` | `/api/v1/customers/{id}` | Get customer details |
+| `PUT` | `/api/v1/customers/{id}` | Update customer |
+| `GET` | `/api/v1/customers/{id}/analysis` | Analyze customer relationship |
+| `GET` | `/api/v1/customers/{id}/call-history` | Get customer call history |
+| `POST` | `/api/v1/customers/create` | Create a customer |
+| `POST` | `/api/v1/customers/create-bulk` | Bulk create customers |
 
 ### Call Management
-- `POST /api/v1/calls/schedule` - Schedule calls for high-risk customers
-- `POST /api/v1/calls/make` - Initiate a call to customer
-- `POST /api/v1/calls/log` - Log a completed call
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `POST` | `/api/v1/calls/test-livekit-sip` | **Place outbound AI voice call via LiveKit SIP** |
+| `POST` | `/api/v1/calls/schedule` | Schedule calls for high-risk customers |
+| `POST` | `/api/v1/calls/make` | Initiate a call to customer |
+| `POST` | `/api/v1/calls/log` | Log a completed call |
+| `GET` | `/api/v1/calls/conversational-demo` | Conversational call demo |
 
-### Reporting & Metrics
-- `GET /api/v1/metrics/summary` - Get system metrics
-- `GET /api/v1/reports/export` - Export call history reports
+### Streaming & Audio
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `POST` | `/api/v1/stream/livekit/session` | Create LiveKit streaming session |
+| `WS` | `/api/v1/stream/livekit/ws/{session_id}` | LiveKit WebSocket stream |
+| `WS` | `/api/v1/stream/twilio/ws` | Twilio WebSocket stream |
+| `GET` | `/api/v1/audio/generate` | Generate TTS audio |
 
-### Development
-- `POST /api/v1/init/dummy-data` - Initialize dummy data (dev only)
-
----
-
-## 📊 Dummy Data
-
-The project includes a dummy data generator with:
-- **50 Sample Customers**: Diverse customer profiles with history
-- **Call History**: 200+ historical calls with various outcomes
-- **Sentiment Analysis**: Positive, neutral, and negative sentiments
-- **Booking Data**: Simulated bookings and revenue
-
-### Generate Dummy Data
-
-Via API:
-```bash
-curl -X POST http://localhost:5000/api/v1/init/dummy-data
-```
-
-Via Python:
-```python
-from src.utils.dummy_data_generator import initialize_dummy_data
-initialize_dummy_data()
-```
+### Reporting & Admin
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/api/v1/metrics/summary` | System metrics |
+| `GET` | `/api/v1/reports/export` | Export call history reports |
+| `POST` | `/api/v1/init/dummy-data` | Initialize dummy data |
 
 ---
 
 ## 🧠 How It Works
 
-### 1. **Customer Analysis**
-The AI agent analyzes each customer's history:
-- Call frequency and recency
-- Sentiment in previous conversations
-- Booking conversion rates
-- Loyalty scores
-- Time since last stay
+### 1. Outbound Call Flow
+```
+API Request (customer_id) → Create LiveKit Room → Dispatch AI Agent → Place SIP Call via Twilio
+                                                                            │
+Customer Answers ──► Audio streams to LiveKit Room ──► AI Agent receives audio
+                                                                            │
+                    Sarvam STT (saaras:v3) ◄──── Buffered audio chunks (1s) │
+                            │                                               │
+                            ▼                                               │
+                    Sarvam LLM (sarvam-m) ◄── Conversation history + system prompt
+                            │                                               │
+                            ▼                                               │
+                    Strip <think> tags ──► Split into sentences             │
+                            │                                               │
+                            ▼                                               │
+                    Sarvam TTS (bulbul:v3) ──► Sentence-level pipelining    │
+                            │                                               │
+                            ▼                                               │
+                    Play audio via LiveKit ──► SIP ──► Twilio ──► Customer phone
+```
 
-### 2. **Churn Risk Scoring**
-Calculates 0-1 churn risk score based on:
-- Engagement level
-- Sentiment trends
-- Booking patterns
-- Time since interaction
-- Loyalty history
+### 2. Agent Persona — "Raj"
+- Warm, friendly male relationship manager at Beacon Hotel
+- Uses speaker "aditya" (male Indian voice) for TTS
+- Makes outbound calls to check in on customers and offer loyalty discounts
+- Responds in English or Hindi based on configuration
+- Keeps responses short (1-2 sentences)
+- Ends calls gracefully after discount is offered and acknowledged
 
-### 3. **Call Scheduling**
-Intelligently schedules calls:
-- Prioritizes high-risk customers
-- Respects call frequency limits
-- Schedules during business hours
-- Avoids recently contacted customers
+### 3. LLM Think-Tag Handling
+The Sarvam `sarvam-m` model always produces `<think>` reasoning blocks. The agent handles this with:
+- `_strip_think_tags()` helper handling 4 cases: complete tags, messy tags, unclosed `<think>`, no tags
+- `reasoning_effort="low"` to minimize thinking overhead
+- 3-tier fallback chain: streaming LLM → non-streaming LLM → retry with direct prompt → hardcoded fallback
 
-### 4. **Call Execution**
-When calling a customer:
-1. Generate personalized script using LLM
-2. Initiate call via Twilio
-3. Monitor conversation in real-time
-4. Record and transcribe call
-5. Analyze sentiment and outcomes
+### 4. Discount Strategy
+| Customer Visits | Discount Offered |
+|----------------|-----------------|
+| 5+ visits | 20% loyalty discount |
+| 2-4 visits | 15% loyalty discount |
+| < 2 visits | 10% welcome discount |
+| Bad experience | 30% recovery discount |
 
-### 5. **Call Logging**
-Complete call history tracking:
-- Transcript storage
-- Sentiment analysis
-- Booking outcomes
-- Discount offered and accepted
-- Follow-up actions needed
+### 5. Call Ending
+The agent detects call endings through:
+- **Agent goodbye keywords**: "goodbye", "take care", "have a great day", etc.
+- **User goodbye keywords**: "bye", "thanks bye", "ok bye", etc.
+- **Max turn limit**: 8 turns
+- Ends call by removing SIP participant via LiveKit API
 
 ---
 
-## 🔌 Integration Points
+## 📊 Latency Breakdown
 
-### Servam API
-Used for three key NLP functions:
-```python
-# Speech to Text
-text = servam_service.speech_to_text(audio_bytes)
+Measured from a real test call:
 
-# Text to Speech
-audio = servam_service.text_to_speech("Hello customer")
+| Stage | Latency |
+|-------|---------|
+| Greeting TTS | ~4.7s (151 chars → 9.1s audio) |
+| STT per chunk | ~300–750ms per 1s audio |
+| LLM streaming | ~3.9s (with thinking overhead) |
+| TTS per sentence | ~1.2–3.0s per sentence |
+| **First audio to user** | **~3.9s** after user stops speaking |
+| **Full turn** | **~18s** (user spoke → agent finished playing) |
 
-# LLM for script generation
-script = servam_service.generate_response(prompt)
-
-# Sentiment analysis
-sentiment = servam_service.analyze_sentiment(transcript)
-```
-
-### Twilio
-Making and managing calls:
-```python
-# Make call
-call_sid = twilio_service.make_call(phone_number, call_script)
-
-# Get call details
-details = twilio_service.get_call_details(call_sid)
-
-# Send SMS
-msg_sid = twilio_service.send_sms(phone_number, message)
-```
+**Bottlenecks**: LLM thinking overhead (~3.9s), TTS REST API latency (~1-3s/sentence).
 
 ---
 
-## 📈 Example Workflow
+## 📝 Logging
+
+Agent logs are written to `logs/agent_session.log` with detailed timing information:
 
 ```
-1. User initiates call scheduling
-   ↓
-2. System loads all active customers
-   ↓
-3. For each customer:
-   - Analyze call history& engagement
-   - Calculate churn risk score
-   - Determine if should call
-   ↓
-4. High-priority customers scheduled
-   ↓
-5. Generate personalized scripts
-   ↓
-6. Make calls via Twilio
-   ↓
-7. Record conversations
-   ↓
-8. Log results and update customer records
-   ↓
-9. Generate reports and metrics
+[TIMING] STT: 753ms for 1000ms audio → 'Right.'
+[TIMING] LLM streaming: 3880ms, raw=1818 chars, clean=155 chars
+[TIMING] TTS: 1173ms for 19 chars → 1.5s audio
+[TIMING] Turn 1 total: 18354ms
 ```
 
----
-
-## 📋 Environment Variables
-
-```bash
-# Environment
-ENVIRONMENT=development  # or "production"
-DEBUG=True
-
-# Servam Configuration
-SERVAM_API_KEY=your-api-key
-SERVAM_API_URL=https://api.servam.com
-SERVAM_STT_MODEL=servam-stt-v1
-SERVAM_TTS_MODEL=servam-tts-v1
-SERVAM_LLM_MODEL=servam-llm-v1
-
-# Twilio Configuration
-TWILIO_ACCOUNT_SID=your-sid
-TWILIO_AUTH_TOKEN=your-token
-TWILIO_PHONE_NUMBER=+1234567890
-
-# Database
-DATABASE_URL=sqlite:///beacon_hotel.db
-
-# Call Management
-MAX_CALLS_PER_DAY=20
-MIN_DAYS_BETWEEN_CALLS=7
-CALL_TIME_START=09:00
-CALL_TIME_END=21:00
-```
+The LiveKit agent worker spawns child processes, so console output is captured by the framework. Use file-based logging for reliable monitoring.
 
 ---
 
 ## 🔐 Security Considerations
 
 - Never commit `.env` file with real credentials
-- Use strong API keys and tokens
-- Validate all incoming API requests
+- All API keys stored in environment variables
 - Use HTTPS in production
-- Implement proper authentication/authorization
-- Sanitize customer data
-- Encrypt sensitive data in database
-- Regular security audits
-
----
-
-## 📝 Logging
-
-Logs are stored in `logs/app.log` with the following levels:
-- INFO - General application events
-- WARNING - Warnings like failed calls
-- ERROR - Errors and exceptions
-
-```python
-logger.info("Call initiated")
-logger.warning("Failed to reach customer")
-logger.error("API error occurred")
-```
+- Validate all incoming API requests
+- Phone numbers in E.164 format
+- Audio recordings stored locally (not transmitted externally)
 
 ---
 
 ## 🧪 Testing
 
-Run unit tests:
 ```bash
-pytest tests/ -v
+# Run unit tests
+python -m pytest tests/ -v
 
 # With coverage
-pytest tests/ --cov=src --cov-report=html
+python -m pytest tests/ --cov=src --cov-report=html
 ```
 
 ---
 
 ## 🚨 Troubleshooting
 
-### Issue: "API Key not recognized"
-**Solution**: Check `.env` file has correct credentials
+### Issue: "livekit-agents SDK not installed"
+**Solution**: `pip install livekit livekit-agents livekit-api`
+
+### Issue: "LiveKit SIP not configured"
+**Solution**: Set `LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET`, `LIVEKIT_SIP_TRUNK_ID` in `.env`
+
+### Issue: No console logs from agent
+**Solution**: Agent runs in a child process. Check `logs/agent_session.log` instead. Use `Get-Content logs/agent_session.log -Tail 50 -Wait` (Windows) or `tail -f` (Linux).
+
+### Issue: Agent speaks thinking/reasoning text
+**Solution**: This is handled by `_strip_think_tags()`. The `sarvam-m` model always produces `<think>` blocks; they are stripped before TTS.
 
 ### Issue: "No module named 'src'"
-**Solution**: Ensure you're running from project root and have activated venv
-
-### Issue: "Database is locked"
-**Solution**: Only one process should access SQLite; use PostgreSQL for production
+**Solution**: Ensure you're running from the project root and have activated the venv.
 
 ### Issue: "Twilio call failed"
-**Solution**: Verify phone number format is E.164 (+1234567890)
+**Solution**: Verify phone number format is E.164 (`+1234567890`). Check SIP trunk configuration in Twilio console.
 
----
-
-## 📊 Metrics & Analytics
-
-The system tracks:
-- **Call Volume**: Total calls made per day/week/month
-- **Conversion Rate**: % of calls resulting in bookings
-- **Average Sentiment**: Customer satisfaction trends
-- **Churn Prevention**: Customers saved from churn
-- **Revenue Impact**: Bookings attributed to outreach
+### Issue: LLM returns empty response (think-only)
+**Solution**: The agent has a 3-tier fallback: streaming → non-streaming → retry with direct prompt → hardcoded contextual fallback.
 
 Access metrics via:
 ```bash

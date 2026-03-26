@@ -8,6 +8,7 @@ __pycache__/
 .Python
 env/
 venv/
+.venv/
 ENV/
 build/
 develop-eggs/
@@ -73,3 +74,6 @@ npm-debug.log
 dist/
 build/
 *.tar.gz
+
+audio/
+*.wav

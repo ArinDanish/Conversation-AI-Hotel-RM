@@ -33,6 +33,7 @@ from src.services.servam_service import ServamService
 from src.services.conversational_call_handler import ConversationalCallManager
 from src.services.audio_service import AudioService
 from src.services.livekit_streaming_service import LiveKitStreamingService
+from src.services.livekit_sip_agent import LiveKitSIPAgentService, LIVEKIT_AGENTS_AVAILABLE
 from src.utils.call_logger import CallLogger
 from src.utils.dummy_data_generator import initialize_dummy_data
 
@@ -69,6 +70,7 @@ conversational_manager = ConversationalCallManager()
 call_logger = CallLogger()
 audio_service = AudioService()
 livekit_streaming_service = LiveKitStreamingService()
+livekit_sip_service = LiveKitSIPAgentService()
 session = get_session()
 
 # Track processed Twilio recordings to avoid duplicate processing from retries/callback races
@@ -171,6 +173,19 @@ class TestCallResponse(BaseModel):
     workflow: Optional[str] = None
     input_format: Optional[str] = None
     output_format: Optional[str] = None
+
+
+class LiveKitSIPCallRequest(BaseModel):
+    customer_id: str
+    language: str = "en"
+
+class LiveKitSIPCallResponse(BaseModel):
+    status: str
+    room_name: str
+    customer_name: str
+    phone: str
+    message: str
+    workflow: str
 
 
 def _build_twilio_stream_twiml(say_text: str, stream_url: str, customer_id: str, conv_id: str) -> str:
@@ -1821,6 +1836,72 @@ def test_call_to_customer(test_call_req: TestCallRequest):
         import traceback
         logger.error(traceback.format_exc())
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/v1/calls/test-livekit-sip", response_model=LiveKitSIPCallResponse, tags=["Streaming"])
+async def test_livekit_sip_call(req: LiveKitSIPCallRequest):
+    """
+    Place an outbound call via LiveKit SIP trunk.
+
+    Architecture:
+      Twilio (PSTN) ← SIP trunk ← LiveKit room ← AI Agent (Sarvam STT → LLM → TTS)
+
+    Prerequisites:
+      - LiveKit Cloud/self-hosted with SIP service enabled
+      - Outbound SIP trunk configured (Twilio SIP trunk → LiveKit)
+      - LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET, LIVEKIT_SIP_TRUNK_ID env vars set
+      - Agent worker running: python -m livekit.agents start src.services.livekit_sip_agent
+
+    Example:
+      {"customer_id": "CUST1001", "language": "en"}
+    """
+    if not LIVEKIT_AGENTS_AVAILABLE:
+        raise HTTPException(
+            status_code=501,
+            detail="livekit-agents SDK not installed. Run: pip install livekit-agents livekit-api livekit",
+        )
+
+    if not livekit_sip_service.is_configured:
+        raise HTTPException(
+            status_code=503,
+            detail="LiveKit SIP not configured. Set LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET, LIVEKIT_SIP_TRUNK_ID.",
+        )
+
+    customer = session.query(Customer).filter_by(customer_id=req.customer_id).first()
+    if not customer:
+        raise HTTPException(status_code=404, detail=f"Customer {req.customer_id} not found")
+
+    logger.info(f"Placing LiveKit SIP call to {customer.name} ({customer.phone})")
+
+    try:
+        result = await livekit_sip_service.create_outbound_call(
+            phone_number=customer.phone,
+            customer_name=customer.name,
+            customer_id=req.customer_id,
+            language=req.language,
+            total_visits=customer.total_visits or 0,
+            loyalty_score=float(customer.loyalty_score or 0),
+            last_stay_date=customer.last_stay_date.strftime('%B %Y') if customer.last_stay_date else None,
+            preferred_room_type=customer.preferred_room_type,
+        )
+    except Exception as e:
+        logger.error(f"LiveKit SIP call failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+    return LiveKitSIPCallResponse(
+        status=result.get("status", "call_placed"),
+        room_name=result.get("room_name", ""),
+        customer_name=customer.name,
+        phone=customer.phone,
+        message=(
+            "LIVEKIT SIP CALL PLACED\n"
+            f"Room: {result.get('room_name', '')}\n"
+            "Flow: Twilio PSTN <- SIP <- LiveKit room <- AI Agent\n"
+            "Agent handles: Sarvam STT -> LLM -> Sarvam TTS -> LiveKit playback"
+        ),
+        workflow="Twilio (PSTN) <- SIP trunk <- LiveKit WebRTC room <- AI Agent (Sarvam STT -> LLM -> TTS)",
+    )
+
 
 @app.get("/api/v1/customers/test-data/list", tags=["TestData"])
 def list_test_customers(limit: int = Query(50, ge=1, le=500)):

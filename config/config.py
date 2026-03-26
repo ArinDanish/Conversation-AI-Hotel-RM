@@ -58,6 +58,12 @@ class Config:
     STT_RETRIES = int(os.getenv("STT_RETRIES", "2"))              # retry attempts on transient errors
     STT_MAX_AUDIO_SECS = float(os.getenv("STT_MAX_AUDIO_SECS", "10"))  # cap audio sent to STT
 
+    # LiveKit SIP Configuration
+    LIVEKIT_URL = os.getenv("LIVEKIT_URL", "")                          # e.g. wss://myproject.livekit.cloud
+    LIVEKIT_API_KEY = os.getenv("LIVEKIT_API_KEY", "")
+    LIVEKIT_API_SECRET = os.getenv("LIVEKIT_API_SECRET", "")
+    LIVEKIT_SIP_TRUNK_ID = os.getenv("LIVEKIT_SIP_TRUNK_ID", "")       # outbound SIP trunk ID (ST_xxx)
+
     # Logging
     LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
     LOG_FILE = os.getenv("LOG_FILE", "logs/app.log")
