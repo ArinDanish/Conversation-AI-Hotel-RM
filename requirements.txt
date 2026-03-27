@@ -1,6 +1,6 @@
 flask==2.3.2
 flask-cors==4.0.0
-fastapi==0.104.1
+fastapi>=0.115.0
 uvicorn==0.24.0
 python-dotenv==1.0.0
 twilio==8.10.0
@@ -16,6 +16,7 @@ pyyaml==6.0
 pytest==7.4.0
 pytest-cov==4.1.0
 sarvamai>=0.1.0
+google-genai>=1.30.0
 livekit>=1.0.0
 livekit-api>=1.0.0
 livekit-agents>=1.0.0

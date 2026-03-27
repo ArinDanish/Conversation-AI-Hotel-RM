@@ -64,6 +64,9 @@ class Config:
     LIVEKIT_API_SECRET = os.getenv("LIVEKIT_API_SECRET", "")
     LIVEKIT_SIP_TRUNK_ID = os.getenv("LIVEKIT_SIP_TRUNK_ID", "")       # outbound SIP trunk ID (ST_xxx)
 
+    # Google Gemini LLM
+    GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
+
     # Logging
     LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
     LOG_FILE = os.getenv("LOG_FILE", "logs/app.log")

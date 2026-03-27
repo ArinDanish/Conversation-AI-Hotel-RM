@@ -62,6 +62,13 @@ try:
 except ImportError:
     SARVAM_ASYNC_AVAILABLE = False
 
+try:
+    from google import genai
+    from google.genai import types as genai_types
+    GOOGLE_GENAI_AVAILABLE = True
+except ImportError:
+    GOOGLE_GENAI_AVAILABLE = False
+
 
 # ---------------------------------------------------------------------------
 # Sarvam STT/TTS helpers (streaming via AsyncSarvamAI websockets)
@@ -112,13 +119,22 @@ class SarvamStreamingPipeline:
         self.tts_language = language_code if language_code != "en-US" else "en-IN"
         self.tts_speaker = "aditya"
         self._client: Optional[AsyncSarvamAI] = None
+        self._gemini_client = None
+        self._gemini_disabled = False  # Set True on 429 to skip wasted requests
         # Accumulate PCM chunks for batch STT
         self._audio_buffer = bytearray()
         self._BUFFER_FLUSH_BYTES = 32000  # 1 second of 16kHz mono 16-bit
 
     async def connect(self):
-        """Initialize the Sarvam async client."""
+        """Initialize the Sarvam async client and Gemini client."""
         self._client = AsyncSarvamAI(api_subscription_key=self.api_key)
+        # Initialize Google Gemini client for LLM
+        google_api_key = config.GOOGLE_API_KEY
+        if google_api_key and GOOGLE_GENAI_AVAILABLE:
+            self._gemini_client = genai.Client(api_key=google_api_key)
+            logger.info("[LLM] Google Gemini client initialized")
+        else:
+            logger.warning("[LLM] Google Gemini not available, falling back to Sarvam LLM")
 
     async def close(self):
         """No persistent connections to close."""
@@ -196,9 +212,60 @@ class SarvamStreamingPipeline:
         except Exception as e:
             logger.error(f"TTS REST error: {e}")
 
+    def _convert_messages_for_gemini(self, messages: list):
+        """Convert OpenAI-style messages to Gemini format.
+        Returns (system_instruction, contents) tuple."""
+        system_instruction = None
+        contents = []
+        for msg in messages:
+            role = msg["role"]
+            text = msg["content"]
+            if role == "system":
+                system_instruction = text
+            elif role == "user":
+                contents.append(genai_types.Content(
+                    role="user",
+                    parts=[genai_types.Part(text=text)],
+                ))
+            elif role == "assistant":
+                contents.append(genai_types.Content(
+                    role="model",
+                    parts=[genai_types.Part(text=text)],
+                ))
+        return system_instruction, contents
+
     async def llm_chat(self, messages: list, max_tokens: int = 512, temperature: float = 0.2) -> Optional[str]:
-        """Call Sarvam LLM via async client and strip <think> blocks."""
+        """Call LLM via Google Gemini (preferred) or Sarvam fallback."""
         import time as _time
+
+        # --- Google Gemini path ---
+        if self._gemini_client and not self._gemini_disabled:
+            try:
+                t0 = _time.perf_counter()
+                system_instruction, contents = self._convert_messages_for_gemini(messages)
+                resp = await self._gemini_client.aio.models.generate_content(
+                    model="gemini-2.5-flash",
+                    contents=contents,
+                    config=genai_types.GenerateContentConfig(
+                        system_instruction=system_instruction,
+                        max_output_tokens=max_tokens,
+                        temperature=temperature,
+                    ),
+                )
+                llm_ms = (_time.perf_counter() - t0) * 1000
+                raw = resp.text or ""
+                logger.info(f"[TIMING] LLM (Gemini): {llm_ms:.0f}ms, raw={len(raw)} chars")
+                logger.info(f"[LLM] Gemini response ({len(raw)} chars): {raw[:120]}")
+                clean = raw.strip()
+                return clean or None
+            except Exception as e:
+                logger.error(f"[LLM] Gemini error: {type(e).__name__}: {e}")
+                if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
+                    self._gemini_disabled = True
+                    logger.warning("[LLM] Gemini quota exhausted — disabled for this session")
+                # Fall through to Sarvam
+
+        # --- Sarvam fallback ---
         if not self._client:
             return None
         try:
@@ -212,8 +279,8 @@ class SarvamStreamingPipeline:
             )
             llm_ms = (_time.perf_counter() - t0) * 1000
             raw = (resp.choices[0].message.content or "") if resp.choices else ""
-            logger.info(f"[TIMING] LLM: {llm_ms:.0f}ms, raw={len(raw)} chars")
-            logger.info(f"[LLM] Raw response ({len(raw)} chars): {raw[:120]}...")
+            logger.info(f"[TIMING] LLM (Sarvam): {llm_ms:.0f}ms, raw={len(raw)} chars")
+            logger.info(f"[LLM] Sarvam raw ({len(raw)} chars): {raw[:120]}...")
 
             clean = _strip_think_tags(raw)
             if clean:
@@ -222,25 +289,83 @@ class SarvamStreamingPipeline:
                 logger.warning(f"[LLM] Empty after sanitize. Raw={raw[:200]}")
             return clean or None
         except Exception as e:
-            logger.error(f"[LLM] Error: {type(e).__name__}: {e}")
+            logger.error(f"[LLM] Sarvam error: {type(e).__name__}: {e}")
             return None
 
     async def llm_chat_streaming(self, messages: list, max_tokens: int = 512, temperature: float = 0.2):
         """
         Stream LLM tokens and yield complete sentences as they form.
         Yields (sentence, is_last) tuples for pipelined TTS.
+        Uses Google Gemini (preferred) with Sarvam fallback.
         """
         import re, time as _time
-        if not self._client:
-            return
 
         t0 = _time.perf_counter()
         first_sentence_time = None
-        buffer = ""
-        full_response = ""
-        raw_stream = ""  # Accumulate everything for tag stripping
         sentence_delimiters = re.compile(r'(?<=[.!?।])\s+')
 
+        # --- Google Gemini streaming path ---
+        if self._gemini_client and not self._gemini_disabled:
+            try:
+                system_instruction, contents = self._convert_messages_for_gemini(messages)
+                raw_stream = ""
+                buffer = ""
+
+                async for chunk in await self._gemini_client.aio.models.generate_content_stream(
+                    model="gemini-2.5-flash",
+                    contents=contents,
+                    config=genai_types.GenerateContentConfig(
+                        system_instruction=system_instruction,
+                        max_output_tokens=max_tokens,
+                        temperature=temperature,
+                    ),
+                ):
+                    token = chunk.text or ""
+                    if not token:
+                        continue
+                    raw_stream += token
+                    buffer += token
+
+                    # Try to yield complete sentences as they form
+                    parts = sentence_delimiters.split(buffer)
+                    if len(parts) > 1:
+                        for sentence in parts[:-1]:
+                            sentence = sentence.strip()
+                            if sentence:
+                                if first_sentence_time is None:
+                                    first_sentence_time = (_time.perf_counter() - t0) * 1000
+                                    logger.info(f"[TIMING] LLM first sentence ready: {first_sentence_time:.0f}ms")
+                                yield (sentence, False)
+                        buffer = parts[-1]
+
+                # Yield remaining buffer
+                remaining = buffer.strip()
+                if remaining:
+                    if first_sentence_time is None:
+                        first_sentence_time = (_time.perf_counter() - t0) * 1000
+                        logger.info(f"[TIMING] LLM first sentence ready: {first_sentence_time:.0f}ms")
+                    yield (remaining, True)
+
+                llm_ms = (_time.perf_counter() - t0) * 1000
+                clean = raw_stream.strip()
+                print(f"[AGENT] LLM streaming (Gemini): {llm_ms:.0f}ms, {len(clean)} chars: {clean[:80]}", flush=True)
+                logger.info(f"[TIMING] LLM streaming (Gemini): {llm_ms:.0f}ms, raw={len(raw_stream)} chars, clean={len(clean)} chars")
+                logger.info(f"[LLM] Gemini streamed: {clean[:120]}")
+                return
+
+            except Exception as e:
+                print(f"[AGENT] Gemini streaming error: {type(e).__name__}: {e}", flush=True)
+                logger.error(f"[LLM] Gemini streaming error: {type(e).__name__}: {e}")
+                if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
+                    self._gemini_disabled = True
+                    logger.warning("[LLM] Gemini quota exhausted — disabled for this session")
+                # Fall through to Sarvam
+
+        # --- Sarvam fallback streaming path ---
+        if not self._client:
+            return
+
+        raw_stream = ""
         try:
             stream = await self._client.chat.completions(
                 messages=messages,
@@ -251,8 +376,6 @@ class SarvamStreamingPipeline:
                 stream=True,
             )
 
-            # Accumulate all tokens, then extract content after </think>
-            # because <think> and </think> tags can be split across chunks
             async for chunk in stream:
                 if not chunk.choices:
                     continue
@@ -261,22 +384,19 @@ class SarvamStreamingPipeline:
                 if token:
                     raw_stream += token
 
-            # Strip think blocks using shared helper (handles unclosed tags)
             clean = _strip_think_tags(raw_stream)
 
             llm_ms = (_time.perf_counter() - t0) * 1000
-            print(f"[AGENT] LLM streaming: {llm_ms:.0f}ms, clean={len(clean)} chars: {clean[:80]}", flush=True)
-            logger.info(f"[TIMING] LLM streaming: {llm_ms:.0f}ms, raw={len(raw_stream)} chars, clean={len(clean)} chars")
+            print(f"[AGENT] LLM streaming (Sarvam): {llm_ms:.0f}ms, clean={len(clean)} chars: {clean[:80]}", flush=True)
+            logger.info(f"[TIMING] LLM streaming (Sarvam): {llm_ms:.0f}ms, raw={len(raw_stream)} chars, clean={len(clean)} chars")
 
             if not clean:
                 print(f"[AGENT] LLM empty! Raw: {raw_stream[:150]}", flush=True)
                 logger.warning(f"[LLM] Streaming returned empty after stripping think. Raw: {raw_stream[:200]}")
                 return
 
-            full_response = clean
-            logger.info(f"[LLM] Streamed response: {clean[:120]}")
+            logger.info(f"[LLM] Sarvam streamed: {clean[:120]}")
 
-            # Split into sentences and yield each
             sentences = sentence_delimiters.split(clean)
             for i, sentence in enumerate(sentences):
                 sentence = sentence.strip()
@@ -443,8 +563,13 @@ Customer Profile:
 IMPORTANT CONTEXT: This is an outbound relationship management call. You called the customer to check in, 
 ask about their experience, and invite them back with a special offer.
 
+LANGUAGE RULES (MANDATORY):
+1. Always reply in the same language the user just used. If the user speaks Hindi, reply in Hindi. If the user speaks English, reply in English. Do NOT mix languages. Do NOT translate. Do NOT explain your language choice.
+2. If the user switches language, you must switch your reply to match their new language for that turn.
+3. Never reply in both languages in the same turn.
+
 RESPONSE RULES:
-1. Respond in {lang_label}. Keep responses SHORT: 1-2 sentences max.
+1. Keep responses SHORT: 1-2 sentences max.
 2. ALWAYS respond to what the customer just said — never ignore their words.
 3. If they ask why you called: explain you're calling to check in and share a special offer.
 4. If they mention a bad experience: apologize sincerely, offer a 30% recovery discount.
@@ -457,6 +582,8 @@ CONVERSATION FLOW:
 - If NO / not sure: "No worries! Whenever you plan, we have a special {discount}% discount waiting for you."
 - After offering discount: Thank them warmly and say goodbye. Use phrases like "Take care" or "Goodbye" to close.
 - IMPORTANT: Once you've offered the discount and they acknowledge it, end the conversation. Say "Thank you so much, {customer_name}. Take care and goodbye sir!" and STOP.
+
+Do NOT wrap your response in <think> tags or include any internal reasoning. Output ONLY the spoken reply.
 
 Be warm, personal, and genuine — like talking to a friend, not reading a script."""
 
@@ -727,7 +854,7 @@ async def _run_sip_session(ctx: "agents.JobContext"):
                             await audio_source.capture_frame(out_frame)
 
                 try:
-                    async for (sentence, is_last) in pipeline.llm_chat_streaming(conversation, max_tokens=1024):
+                    async for (sentence, is_last) in pipeline.llm_chat_streaming(conversation, max_tokens=2048):
                         llm_text_full += sentence + (" " if not is_last else "")
                         if not first_audio_played:
                             _first_audio_ms = (_time.perf_counter() - _turn_start) * 1000
@@ -747,14 +874,22 @@ async def _run_sip_session(ctx: "agents.JobContext"):
                     else:
                         print("[AGENT] Streaming empty, falling back to non-streaming", flush=True)
                         logger.warning("[SIP] Streaming LLM returned empty, falling back to non-streaming")
-                    llm_text_full = await pipeline.llm_chat(conversation, max_tokens=1024) or ""
+                    llm_text_full = await pipeline.llm_chat(conversation, max_tokens=2048) or ""
 
                 # Retry: if model spent all tokens on thinking, ask directly
                 if not llm_text_full.strip():
                     logger.warning("[SIP] Both LLM paths returned only thinking. Retrying with direct prompt.")
                     print("[AGENT] Retrying LLM with direct prompt", flush=True)
                     retry_msgs = conversation.copy()
-                    retry_msgs.append({"role": "user", "content": "Please respond directly in 1-2 sentences. No reasoning needed."})
+                    # Amend the last user message instead of adding a second one
+                    # (API requires alternating user/assistant turns)
+                    if retry_msgs and retry_msgs[-1]["role"] == "user":
+                        retry_msgs[-1] = {
+                            "role": "user",
+                            "content": retry_msgs[-1]["content"] + "\n\n(Please respond directly in 1-2 sentences. No reasoning needed.)",
+                        }
+                    else:
+                        retry_msgs.append({"role": "user", "content": "Please respond directly in 1-2 sentences. No reasoning needed."})
                     llm_text_full = await pipeline.llm_chat(retry_msgs, max_tokens=256) or ""
 
                 # Last resort fallback
