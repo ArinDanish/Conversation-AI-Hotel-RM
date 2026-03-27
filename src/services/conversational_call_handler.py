@@ -198,10 +198,10 @@ Turn 3+: Thank them and say goodbye. The call should end naturally after the dis
 IMPORTANT: Once you have offered the discount and said goodbye, do NOT continue the conversation. End warmly.
 
 CRITICAL LANGUAGE RULE:
-- Respond ONLY in {language}
-- If they speak Hindi → respond in Hindi
-- Do NOT translate to English
-- Keep Hindi responses natural and friendly (use हाँ, ठीक है, आदि)
+- Always respond in the language the user is currently using.
+- If the user changes language during the conversation, immediately switch and reply in the user's new language for all future responses.
+- Do not translate or repeat in another language unless the user switches language.
+- For the first message, use this language: {language}
 
 Language Context: {language}"""
             
@@ -497,14 +497,14 @@ CODE ONLY:"""
             lang_names = {"en": "English", "hi": "हिंदी", "ta": "Tamil", "te": "Telugu", "ml": "Malayalam"}
             lang_instruction = f"""
 
-🔴 MANDATORY - Respond in {lang_names.get(lang, 'English')} ONLY:
-- If user speaks Hindi (हिंदी) → Respond in Hindi (हिंदी)
-- If user speaks English → Respond in English
-- Do NOT translate responses to English
-- Do NOT mix languages
-- Keep response SHORT: 1-2 sentences
-- Keep the conversation focused: quickly ask visit intent, then offer, then close naturally
-- Avoid repetitive probing questions or long back-and-forth
+🔴 MANDATORY - Respond in {lang_names.get(lang, lang)} ONLY:
+- Always reply in the language the user is currently using: {lang_names.get(lang, lang)}.
+- If the user switches language during the conversation, immediately switch and reply in the user's new language for all future responses.
+- Do NOT translate or repeat in another language unless the user switches language.
+- Do NOT mix languages in a single response.
+- Keep response SHORT: 1-2 sentences.
+- Keep the conversation focused: quickly ask visit intent, then offer, then close naturally.
+- Avoid repetitive probing questions or long back-and-forth.
 
 Conversation so far: {len(context['messages'])} messages. Reference previous answers when responding."""
             

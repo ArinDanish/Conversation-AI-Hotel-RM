@@ -1693,21 +1693,24 @@ def test_call_to_customer(test_call_req: TestCallRequest):
         logger.info(f"🎙️ Initiating test call for {customer.customer_id} ({customer.phone})")
 
         # Treat stream_call as an explicit signal to use streaming mode even if streaming_mode is omitted
+
         effective_streaming_mode = test_call_req.streaming_mode or test_call_req.stream_call
+        # Use requested language, fallback to 'en' if not provided
+        requested_language = test_call_req.language or "en"
 
         # Streaming mode with live call: place Twilio call and stream audio directly (no recording)
         if effective_streaming_mode and test_call_req.stream_call:
             call_sid = f"CONV_{uuid.uuid4().hex[:12]}"
 
-            context = conversational_manager.init_conversation(call_sid, test_call_req.customer_id, "en")
+            context = conversational_manager.init_conversation(call_sid, test_call_req.customer_id, requested_language)
             if not context:
                 raise HTTPException(status_code=500, detail="Failed to initialize conversation")
 
-            greeting = conversational_manager.get_greeting(customer.name, "en")
+            greeting = conversational_manager.get_greeting(customer.name, requested_language)
             stream_http_url = f"{config.NGROK_BASE_URL}/api/v1/stream/twilio/ws"
             stream_url = _http_to_ws_url(stream_http_url)
 
-            greeting_audio_url = conversational_manager.text_to_speech_url(greeting, "en")
+            greeting_audio_url = conversational_manager.text_to_speech_url(greeting, requested_language)
             if greeting_audio_url:
                 full_audio_url = f"{config.NGROK_BASE_URL}{greeting_audio_url}" if not greeting_audio_url.startswith("http") else greeting_audio_url
                 twiml = _build_twilio_stream_play_twiml(full_audio_url, stream_url, test_call_req.customer_id, call_sid)
@@ -1747,13 +1750,15 @@ def test_call_to_customer(test_call_req: TestCallRequest):
             )
 
         # Streaming test mode: return websocket session details for LiveKit bridge
+
         if effective_streaming_mode:
             session_id = f"lk_{uuid.uuid4().hex[:12]}"
             base_url = (config.NGROK_BASE_URL or "http://localhost:8000").strip().rstrip("/")
             ws_base = base_url.replace("https://", "wss://").replace("http://", "ws://")
+            # Use requested_language for the websocket URL
             websocket_url = (
                 f"{ws_base}/api/v1/stream/livekit/ws/{session_id}"
-                f"?language={test_call_req.language}&customer_name={customer.name}"
+                f"?language={requested_language}&customer_name={customer.name}"
             )
 
             logger.info(f"✓ Streaming test session ready: {session_id}")
@@ -1779,30 +1784,29 @@ def test_call_to_customer(test_call_req: TestCallRequest):
         
         # Twilio call mode: Generate call SID for conversation tracking
         call_sid = f"CONV_{uuid.uuid4().hex[:12]}"
-        
+
         # Step 1: Initialize conversation with LLM system prompt
         logger.info("Initializing conversation context with system prompt...")
-        language = "en"
-        context = conversational_manager.init_conversation(call_sid, test_call_req.customer_id, language)
+        context = conversational_manager.init_conversation(call_sid, test_call_req.customer_id, requested_language)
         if not context:
             raise HTTPException(status_code=500, detail="Failed to initialize conversation")
-        
+
         # Step 2: Generate greeting
         logger.info("Generating personalized greeting...")
-        greeting = conversational_manager.get_greeting(customer.name, language)
+        greeting = conversational_manager.get_greeting(customer.name, requested_language)
         logger.info(f"📝 Greeting: {greeting}")
-        
+
         # Step 3: Generate TTS audio URL (on-the-fly, no file storage)
-        audio_url = conversational_manager.text_to_speech_url(greeting, language)
+        audio_url = conversational_manager.text_to_speech_url(greeting, requested_language)
         if not audio_url:
             logger.warning("TTS generation failed, cannot make call without audio")
             raise HTTPException(status_code=500, detail="TTS service unavailable")
-        
+
         # Generate initial TwiML with greeting
         full_audio_url = f"{config.NGROK_BASE_URL}{audio_url}" if not audio_url.startswith("http") else audio_url
         webhook_url = f"{config.NGROK_BASE_URL}/api/v1/calls/handle-conversational-response?call_sid={call_sid}&customer_id={test_call_req.customer_id}"
-        initial_twiml = conversational_manager.get_next_twiml(full_audio_url, webhook_url, language)
-        
+        initial_twiml = conversational_manager.get_next_twiml(full_audio_url, webhook_url, requested_language)
+
         # Step 4: Make the call with initial TwiML
         logger.info(f"Making call via Twilio...")
         try:
@@ -1819,7 +1823,7 @@ def test_call_to_customer(test_call_req: TestCallRequest):
             logger.error(f"Twilio call failed: {str(e)}")
             # Use mock SID for testing
             logger.warning("Using mock call SID for demo")
-        
+
         return TestCallResponse(
             status="call_initiated",
             call_sid=call_sid,
