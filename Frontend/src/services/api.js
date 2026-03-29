@@ -15,7 +15,7 @@ export const api = {
   },
 
   // Trigger Call
-  triggerCall: async (customerId) => {
+  triggerCall: async (customerId, language) => {
     const res = await fetch(`${BASE_URL}/api/v1/calls/test-livekit-sip`, {
       method: "POST",
       headers: {
@@ -23,17 +23,16 @@ export const api = {
       },
       body: JSON.stringify({
         customer_id: customerId,
-        language: "en",
+        language: language,
       }),
     });
 
     return res.json();
   },
-
   // Get Call History
   getCallHistory: async (customerId) => {
     const res = await fetch(
-      `${BASE_URL}/api/v1/customers/${customerId}/call-history`
+      `${BASE_URL}/api/v1/customers/${customerId}/call-history`,
     );
 
     return res.json();

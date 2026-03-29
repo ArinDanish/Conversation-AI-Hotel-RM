@@ -6,6 +6,7 @@ export default function Call() {
   const [status, setStatus] = useState("");
 
   const [loading, setLoading] = useState(false);
+  const [language, setLanguage] = useState("en");
 
   const handleCall = async () => {
     if (loading) return;
@@ -14,7 +15,7 @@ export default function Call() {
 
     setLoading(true);
     try {
-      const res = await api.triggerCall(customerId);
+      const res = await api.triggerCall(customerId, language);
       setStatus(res.message || "Call Triggered ✅");
     } catch (err) {
       setStatus(err.message);
@@ -34,6 +35,17 @@ export default function Call() {
           onChange={(e) => setCustomerId(e.target.value)}
           className="border p-2 mr-2"
         />
+        <select
+          value={language}
+          onChange={(e) => setLanguage(e.target.value)}
+          className="border p-2 mr-2"
+        >
+          <option value="en">English</option>
+          <option value="hi">Hindi</option>
+          <option value="ta">Tamil</option>
+          <option value="te">Telugu</option>
+          <option value="ml">Malayalam</option>
+        </select>
 
         <button
           onClick={handleCall}
