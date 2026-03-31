@@ -62,7 +62,10 @@ class Config:
     LIVEKIT_URL = os.getenv("LIVEKIT_URL", "")                          # e.g. wss://myproject.livekit.cloud
     LIVEKIT_API_KEY = os.getenv("LIVEKIT_API_KEY", "")
     LIVEKIT_API_SECRET = os.getenv("LIVEKIT_API_SECRET", "")
-    LIVEKIT_SIP_TRUNK_ID = os.getenv("LIVEKIT_SIP_TRUNK_ID", "")       # outbound SIP trunk ID (ST_xxx)
+    LIVEKIT_SIP_TRUNK_ID = os.getenv("LIVEKIT_SIP_TRUNK_ID", "")       # outbound SIP trunk ID for Twilio (ST_xxx)
+
+    # Exotel SIP Configuration (uses LiveKit SIP with Exotel trunk)
+    EXOTEL_SIP_TRUNK_ID = os.getenv("EXOTEL_SIP_TRUNK_ID", "")         # outbound SIP trunk ID for Exotel (ST_xxx)
 
     # Google Gemini LLM
     GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")

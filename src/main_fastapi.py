@@ -187,6 +187,19 @@ class LiveKitSIPCallResponse(BaseModel):
     message: str
     workflow: str
 
+class ExotelSIPCallRequest(BaseModel):
+    customer_id: str
+    language: str = "en"
+
+class ExotelSIPCallResponse(BaseModel):
+    status: str
+    room_name: str
+    customer_name: str
+    phone: str
+    message: str
+    workflow: str
+    sip_provider: str = "exotel"
+
 
 def _build_twilio_stream_twiml(say_text: str, stream_url: str, customer_id: str, conv_id: str) -> str:
     safe_text = (say_text or "").replace("&", "and").replace("<", " ").replace(">", " ")
@@ -1904,6 +1917,81 @@ async def test_livekit_sip_call(req: LiveKitSIPCallRequest):
             "Agent handles: Sarvam STT -> LLM -> Sarvam TTS -> LiveKit playback"
         ),
         workflow="Twilio (PSTN) <- SIP trunk <- LiveKit WebRTC room <- AI Agent (Sarvam STT -> LLM -> TTS)",
+    )
+
+
+@app.post("/api/v1/calls/test-exotel-sip", response_model=ExotelSIPCallResponse, tags=["Streaming"])
+async def test_exotel_sip_call(req: ExotelSIPCallRequest):
+    """
+    Place an outbound call via LiveKit SIP trunk routed through Exotel.
+
+    Architecture:
+      Exotel (PSTN) ← SIP trunk ← LiveKit room ← AI Agent (Sarvam STT → LLM → TTS)
+
+    Same AI agent logic as the Twilio SIP endpoint, but uses Exotel as the
+    telephony provider for PSTN connectivity.
+
+    Prerequisites:
+      - LiveKit Cloud/self-hosted with SIP service enabled
+      - Outbound SIP trunk configured for Exotel
+      - LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET, EXOTEL_SIP_TRUNK_ID env vars set
+      - Agent worker running: python -m livekit.agents start src.services.livekit_sip_agent
+
+    Example:
+      {"customer_id": "CUST1001", "language": "ta"}
+    """
+    if not LIVEKIT_AGENTS_AVAILABLE:
+        raise HTTPException(
+            status_code=501,
+            detail="livekit-agents SDK not installed. Run: pip install livekit-agents livekit-api livekit",
+        )
+
+    if not livekit_sip_service.is_configured:
+        raise HTTPException(
+            status_code=503,
+            detail="LiveKit not configured. Set LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET.",
+        )
+
+    if not config.EXOTEL_SIP_TRUNK_ID:
+        raise HTTPException(
+            status_code=503,
+            detail="Exotel SIP trunk not configured. Set EXOTEL_SIP_TRUNK_ID env var.",
+        )
+
+    customer = session.query(Customer).filter_by(customer_id=req.customer_id).first()
+    if not customer:
+        raise HTTPException(status_code=404, detail=f"Customer {req.customer_id} not found")
+
+    logger.info(f"Placing Exotel SIP call to {customer.name} ({customer.phone})")
+
+    try:
+        result = await livekit_sip_service.create_outbound_call_exotel(
+            phone_number=customer.phone,
+            customer_name=customer.name,
+            customer_id=req.customer_id,
+            language=req.language,
+            total_visits=customer.total_visits or 0,
+            loyalty_score=float(customer.loyalty_score or 0),
+            last_stay_date=customer.last_stay_date.strftime('%B %Y') if customer.last_stay_date else None,
+            preferred_room_type=customer.preferred_room_type,
+        )
+    except Exception as e:
+        logger.error(f"Exotel SIP call failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+    return ExotelSIPCallResponse(
+        status=result.get("status", "call_placed"),
+        room_name=result.get("room_name", ""),
+        customer_name=customer.name,
+        phone=customer.phone,
+        message=(
+            "EXOTEL SIP CALL PLACED\n"
+            f"Room: {result.get('room_name', '')}\n"
+            "Flow: Exotel PSTN <- SIP <- LiveKit room <- AI Agent\n"
+            "Agent handles: Sarvam STT -> LLM -> Sarvam TTS -> LiveKit playback"
+        ),
+        workflow="Exotel (PSTN) <- SIP trunk <- LiveKit WebRTC room <- AI Agent (Sarvam STT -> LLM -> TTS)",
+        sip_provider="exotel",
     )
 
 

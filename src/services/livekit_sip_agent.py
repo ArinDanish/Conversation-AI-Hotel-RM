@@ -530,6 +530,102 @@ class LiveKitSIPAgentService:
         finally:
             await lkapi.aclose()
 
+    # ---- outbound call via Exotel SIP trunk ----
+
+    async def create_outbound_call_exotel(
+        self,
+        phone_number: str,
+        customer_name: str = "Guest",
+        customer_id: str = "",
+        language: str = "en",
+        total_visits: int = 0,
+        loyalty_score: float = 0.0,
+        last_stay_date: Optional[str] = None,
+        preferred_room_type: Optional[str] = None,
+    ) -> Dict:
+        """
+        Place an outbound call through LiveKit SIP using Exotel trunk.
+
+        Same architecture as Twilio SIP but routes through Exotel PSTN:
+          1. Create a unique LiveKit room
+          2. Dispatch the AI agent into the room
+          3. Create a SIP participant via Exotel trunk (dials the phone number)
+
+        Returns dict with room_name, participant info, and status.
+        """
+        if not LIVEKIT_AGENTS_AVAILABLE:
+            raise RuntimeError("livekit-agents SDK not installed. pip install livekit-agents livekit-api livekit")
+
+        exotel_trunk_id = config.EXOTEL_SIP_TRUNK_ID
+        if not self.is_configured or not exotel_trunk_id:
+            raise RuntimeError(
+                "Exotel SIP not configured. Set LIVEKIT_URL, LIVEKIT_API_KEY, "
+                "LIVEKIT_API_SECRET, and EXOTEL_SIP_TRUNK_ID env vars."
+            )
+
+        room_name = f"exotel-call-{uuid.uuid4().hex[:10]}"
+        participant_identity = phone_number
+
+        metadata = json.dumps({
+            "phone_number": phone_number,
+            "customer_name": customer_name,
+            "customer_id": customer_id,
+            "language": language,
+            "total_visits": total_visits,
+            "loyalty_score": loyalty_score,
+            "last_stay_date": last_stay_date,
+            "preferred_room_type": preferred_room_type,
+            "sip_provider": "exotel",
+        })
+
+        lkapi = api.LiveKitAPI(
+            url=self.livekit_url,
+            api_key=self.api_key,
+            api_secret=self.api_secret,
+        )
+
+        try:
+            # 1. Dispatch the agent into the room
+            await lkapi.agent_dispatch.create_dispatch(
+                api.CreateAgentDispatchRequest(
+                    agent_name="hotel-rm-sip-agent",
+                    room=room_name,
+                    metadata=metadata,
+                )
+            )
+            logger.info(f"Agent dispatched to Exotel room {room_name}")
+
+            # 2. Place the SIP outbound call via Exotel trunk
+            from livekit.protocol.sip import CreateSIPParticipantRequest
+
+            sip_request = CreateSIPParticipantRequest(
+                sip_trunk_id=exotel_trunk_id,
+                sip_call_to=phone_number,
+                room_name=room_name,
+                participant_identity=participant_identity,
+                participant_name=customer_name,
+                krisp_enabled=True,
+                wait_until_answered=True,
+            )
+
+            sip_info = await lkapi.sip.create_sip_participant(sip_request)
+            logger.info(f"Exotel SIP participant created: {sip_info}")
+
+            return {
+                "status": "call_placed",
+                "room_name": room_name,
+                "sip_participant_id": getattr(sip_info, "participant_id", ""),
+                "phone_number": phone_number,
+                "customer_name": customer_name,
+                "sip_provider": "exotel",
+            }
+
+        except Exception as e:
+            logger.error(f"Failed to create Exotel outbound SIP call: {e}")
+            raise
+        finally:
+            await lkapi.aclose()
+
 
 # ---------------------------------------------------------------------------
 # Agent entry-point  (run as: python -m livekit.agents start src.services.livekit_sip_agent)
