@@ -449,6 +449,7 @@ class LiveKitSIPAgentService:
         loyalty_score: float = 0.0,
         last_stay_date: Optional[str] = None,
         preferred_room_type: Optional[str] = None,
+        custom_prompt: str = None,
     ) -> Dict:
         """
         Place an outbound call through LiveKit SIP.
@@ -477,6 +478,7 @@ class LiveKitSIPAgentService:
             "customer_name": customer_name,
             "customer_id": customer_id,
             "language": language,
+            "custom_prompt": custom_prompt,
             "total_visits": total_visits,
             "loyalty_score": loyalty_score,
             "last_stay_date": last_stay_date,
@@ -613,6 +615,7 @@ async def _run_sip_session(ctx: "agents.JobContext"):
     customer_name = meta.get("customer_name", "Guest")
     customer_id = meta.get("customer_id", "")
     language = meta.get("language", "en")
+    custom_prompt = meta.get("custom_prompt")
     total_visits = meta.get("total_visits", 0)
     loyalty_score = meta.get("loyalty_score", 0.0)
     last_stay_date = meta.get("last_stay_date")
@@ -626,12 +629,46 @@ async def _run_sip_session(ctx: "agents.JobContext"):
     }
     lang_prefix = language.split("-")[0] if "-" in language else language
     lang_code = _lang_code_map.get(lang_prefix, language if "-" in language else "en-IN")
-    system_prompt = _build_system_prompt(
-        customer_name, language,
-        total_visits=total_visits,
-        loyalty_score=loyalty_score,
-        last_stay_date=last_stay_date,
-        preferred_room_type=preferred_room_type,
+    if custom_prompt:
+        system_prompt = f"""
+        {custom_prompt}
+
+        You are speaking on a real phone call.
+
+        IMPORTANT LANGUAGE RULES:
+        - Speak only in {language} — this is the language the caller has chosen.
+        - Do not switch languages. If the caller speaks in Hindi, you must reply in Hindi. If they speak in English, reply in English. Do NOT mix languages or translate.
+        -
+
+        IMPORTANT SPEAKING STYLE:
+        - Speak like a real human, NOT like a robot
+        - Use short sentences (5–12 words)
+        - Add natural fillers occasionally: "um", "well", "actually"
+        - Pause naturally using commas
+        - Do NOT speak long paragraphs
+        - Respond based on what the user says (no fixed script)
+
+        CONVERSATION STYLE:
+        - Be friendly, warm and slightly persuasive
+        - If user is confused → explain simply
+        - If user is not interested → respond politely and try once more
+        - If user says bye → end call immediately
+
+        ENDING RULE:
+        - After goal is achieved → say a short closing line and end call
+
+        VERY IMPORTANT:
+        - No AI tone
+        - No formal language
+        - Sound like a normal Indian caller
+        """
+    else:
+        system_prompt = _build_system_prompt(
+            customer_name, language,
+            total_visits=total_visits,
+            loyalty_score=loyalty_score,
+            last_stay_date=last_stay_date,
+            preferred_room_type=preferred_room_type,
     )
     conversation = [{"role": "system", "content": system_prompt}]
 
@@ -712,15 +749,41 @@ async def _run_sip_session(ctx: "agents.JobContext"):
     await pipeline.connect()
 
     # Send greeting — outbound RM call, introduce yourself and purpose
-    _greetings = {
-        "en": f"Hello {customer_name}! This is Raj calling from Beacon Hotel. Hope you're doing well! I'm just calling to check in and see how your experience has been with us.",
-        "hi": f"नमस्ते {customer_name}! मैं Raj, Beacon Hotel से बात कर रहा हूँ। उम्मीद है आप अच्छे हैं! बस आपसे बात करने के लिए कॉल किया, जानना चाहता था कि हमारे साथ आपका अनुभव कैसा रहा।",
-        "ta": f"வணக்கம் {customer_name}! நான் Raj, Beacon Hotel-லிருந்து அழைக்கிறேன். நீங்கள் நலமாக இருப்பீர்கள் என்று நம்புகிறேன்! எங்களுடன் உங்கள் அனுபவம் எப்படி இருந்தது என்று தெரிந்துகொள்ள விரும்புகிறேன்.",
-        "te": f"నమస్కారం {customer_name}! నేను Raj, Beacon Hotel నుండి కాల్ చేస్తున్నాను. మీరు బాగున్నారని ఆశిస్తున్నాను! మాతో మీ అనుభవం ఎలా ఉందో తెలుసుకోవాలనుకుంటున్నాను.",
-        "ml": f"നമസ്കാകം {customer_name}! ഞാൻ Raj, Beacon Hotel-ൽ നിന്ന് വിളിക്കുകയാണ്. നിങ്ങൾ സുഖമായിരിക്കും എന്ന് പ്രതീക്ഷിക്കുന്നു! ഞങ്ങളുമായുള്ള നിങ്ങളുടെ അനുഭവം എങ്ങനെയായിരുന്നു എന്ന് അറിയാൻ ആഗ്രഹിക്കുന്നു.",
-    }
-    lang_prefix_for_greeting = language.split("-")[0] if "-" in language else language
-    greeting = _greetings.get(lang_prefix_for_greeting, _greetings["en"])
+    
+    # Dynamic greeting logic
+
+    if custom_prompt:
+        greeting_prompt = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"Start the call with a natural greeting in {language}"}
+        ]
+
+        greeting = await pipeline.llm_chat(greeting_prompt, max_tokens=50)
+
+        # fallback if LLM fails
+        if not greeting:
+            if language == "en":
+                greeting = f"Hello {customer_name}! This is Raj calling from Beacon Hotel. Hope you're doing well!"
+            elif language == "hi":
+                greeting = f"नमस्ते {customer_name}! मैं Raj, Beacon Hotel से बात कर रहा हूँ। उम्मीद है आप अच्छे हैं!"
+            elif language == "ta":
+                greeting = f"வணக்கம் {customer_name}! நான் Raj, Beacon Hotel-லிருந்து அழைக்கிறேன்."    
+            elif language == "te":
+                greeting = f"నమస్కారం {customer_name}! నేను Raj, Beacon Hotel నుండి కాల్ చేస్తున్నాను."
+            elif language == "ml":
+                greeting = f"നമസ്കാരം {customer_name}! ഞാൻ Raj, Beacon Hotel-ൽ നിന്ന് വിളിക്കുകയാണ്."
+
+    else:
+        _greetings = {
+            "en": f"Hello {customer_name}! This is Raj calling from Beacon Hotel. Hope you're doing well!",
+            "hi": f"नमस्ते {customer_name}! मैं Raj, Beacon Hotel से बात कर रहा हूँ। उम्मीद है आप अच्छे हैं!",
+            "ta": f"வணக்கம் {customer_name}! நான் Raj, Beacon Hotel-லிருந்து அழைக்கிறேன்.",
+            "te": f"నమస్కారం {customer_name}! నేను Raj, Beacon Hotel నుండి కాల్ చేస్తున్నాను.",
+            "ml": f"നമസ്കാരം {customer_name}! ഞാൻ Raj, Beacon Hotel-ൽ നിന്ന് വിളിക്കുകയാണ്."
+        }
+
+        lang_prefix = language.split("-")[0] if "-" in language else language
+        greeting = _greetings.get(lang_prefix, _greetings["en"])
 
     # NOTE: Don't add greeting to conversation yet — Sarvam-m requires
     # the first non-system message to be from the user. We'll inject it

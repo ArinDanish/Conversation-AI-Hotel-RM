@@ -7,6 +7,7 @@ export default function Call() {
 
   const [loading, setLoading] = useState(false);
   const [language, setLanguage] = useState("en");
+  const [customPrompt, setCustomPrompt] = useState("");
 
   const handleCall = async () => {
     if (loading) return;
@@ -15,7 +16,7 @@ export default function Call() {
 
     setLoading(true);
     try {
-      const res = await api.triggerCall(customerId, language);
+      const res = await api.triggerCall(customerId, language, customPrompt);
       setStatus(res.message || "Call Triggered ✅");
     } catch (err) {
       setStatus(err.message);
@@ -28,6 +29,12 @@ export default function Call() {
       <h1 className="text-2xl font-bold mb-4">Trigger Call</h1>
 
       <div className="bg-white p-6 rounded shadow">
+        <textarea
+          placeholder="Enter your custom calling prompt..."
+          value={customPrompt}
+          onChange={(e) => setCustomPrompt(e.target.value)}
+          className="border p-2 w-full mb-3 h-24"
+        ></textarea>
         <input
           type="text"
           placeholder="Enter Customer ID"

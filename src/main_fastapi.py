@@ -192,6 +192,7 @@ class TestCallResponse(BaseModel):
 class LiveKitSIPCallRequest(BaseModel):
     customer_id: str
     language: str = "en"
+    custom_prompt: str = None
 
 
 class LiveKitSIPCallResponse(BaseModel):
@@ -2073,6 +2074,7 @@ async def test_livekit_sip_call(req: LiveKitSIPCallRequest):
             customer_name=customer.name,
             customer_id=req.customer_id,
             language=req.language,
+            custom_prompt=req.custom_prompt,
             total_visits=customer.total_visits or 0,
             loyalty_score=float(customer.loyalty_score or 0),
             last_stay_date=customer.last_stay_date.strftime(
