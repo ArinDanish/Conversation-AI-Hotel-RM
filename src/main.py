@@ -19,6 +19,7 @@ from src.services.twilio_service import TwilioService
 from src.services.servam_service import ServamService
 from src.utils.call_logger import CallLogger
 from src.utils.dummy_data_generator import initialize_dummy_data
+from fastapi import FastAPI
 
 # Configure logging
 logging.basicConfig(
@@ -317,6 +318,6 @@ if __name__ == '__main__':
     # Run Flask app
     app.run(
         host='0.0.0.0',
-        port=5000,
+        port=8000,
         debug=config.DEBUG
     )
