@@ -18,7 +18,7 @@ from pathlib import Path
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi import FastAPI, HTTPException, Query, Form, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Query, Form, Request, WebSocket, WebSocketDisconnect
 import wave
 import io
 import audioop
@@ -50,6 +50,10 @@ app = FastAPI(
     description="AI-powered customer relationship management system",
     version="1.0.0"
 )
+
+@app.options("/{full_path:path}")
+async def options_handler(full_path: str, request: Request):
+    return Response(status_code=200)
 
 # Add CORS middleware
 app.add_middleware(
